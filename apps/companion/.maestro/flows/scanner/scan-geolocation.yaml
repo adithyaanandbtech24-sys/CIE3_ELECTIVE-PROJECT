@@ -1,0 +1,47 @@
+# Scan geolocation e2e (PR #2768: feat/companion-scan-geolocation)
+#
+# Precondition: signed-in session (qa-admin1 / GRANULAR WORKSPACE), simulator
+# location set (xcrun simctl location <udid> set 52.3702,4.8952), Metro
+# serving this branch, webapp for this branch reachable at the app's
+# EXPO_PUBLIC_API_URL.
+#
+# Verifies rule 2 of lib/scan-location.ts: the OS permission prompt appears
+# ONCE on first scanner focus (primeScanLocation). The camera can't scan in
+# the simulator, and a QR deep link resolves WITHOUT recording a scan or a
+# position, so the final step only proves the link opens the asset. Check a
+# recorded position with the scanner's manual code entry instead. DB +
+# Metro-log assertions happen outside Maestro.
+appId: com.shelf.companion.carlos
+---
+# Wait for the app shell before tapping (a tap during boot is swallowed)
+- extendedWaitUntil:
+    visible: ".*Assets.*"
+    timeout: 15000
+
+# First scanner focus. On a fresh install the camera gate + OS camera
+# prompt come first; both steps are optional so the flow also passes on a
+# device that already granted camera.
+- tapOn: "Scan"
+- tapOn:
+    text: "Grant Permission"
+    optional: true
+- tapOn:
+    text: "Allow"
+    optional: true
+
+# Lazy location prompt (primeScanLocation on first scanner focus)
+- extendedWaitUntil:
+    visible: ".*Allow.*location.*"
+    timeout: 10000
+- tapOn: "Allow While Using App"
+
+# Give the background fix a beat to warm from the simulated location
+- extendedWaitUntil:
+    visible: ".*Scan.*"
+    timeout: 5000
+
+# Resolve a known asset-linked QR through a link (records nothing)
+- openLink: shelf://qr/c3phv1e1cc
+- extendedWaitUntil:
+    visible: ".*Laerdal SimMan 3G.*"
+    timeout: 15000

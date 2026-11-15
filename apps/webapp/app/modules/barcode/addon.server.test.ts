@@ -1,0 +1,855 @@
+import type Stripe from "stripe";
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { ShelfError } from "~/utils/error";
+
+// why: Stripe SDK makes external API calls
+const { mockStripe } = vi.hoisted(() => ({
+  mockStripe: {
+    checkout: { sessions: { create: vi.fn() } },
+    subscriptions: { create: vi.fn(), list: vi.fn(), update: vi.fn() },
+    prices: { list: vi.fn(), retrieve: vi.fn() },
+    products: { retrieve: vi.fn() },
+    paymentMethods: { list: vi.fn() },
+  },
+}));
+
+// why: control premiumIsEnabled flag
+const { mockPremiumIsEnabled } = vi.hoisted(() => ({
+  mockPremiumIsEnabled: { value: true },
+}));
+
+// why: the other-subscription check is a Stripe round trip of its own; each
+// test states whether another live subscription still carries the add-on
+const { mockHasOtherActiveAddonSubscription } = vi.hoisted(() => ({
+  mockHasOtherActiveAddonSubscription: vi.fn(),
+}));
+
+vi.mock("~/utils/stripe.server", () => ({
+  stripe: mockStripe,
+  customerHasOtherActiveAddonSubscription: mockHasOtherActiveAddonSubscription,
+  get premiumIsEnabled() {
+    return mockPremiumIsEnabled.value;
+  },
+}));
+
+// why: Database module connects to Prisma during import
+const { mockOrgUpdate } = vi.hoisted(() => ({
+  mockOrgUpdate: vi.fn(),
+}));
+
+vi.mock("~/database/db.server", () => ({
+  db: {
+    organization: {
+      update: mockOrgUpdate,
+    },
+  },
+}));
+
+import {
+  createBarcodeAddonCheckoutSession,
+  createBarcodeAddonTrialSubscription,
+  getBarcodeAddonPrices,
+  linkBarcodeAddonToOrganization,
+  getBarcodeSubscriptionInfo,
+  handleBarcodeAddonWebhook,
+} from "./addon.server";
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // why: `assertPriceIsForAddon` resolves the price server-side before any
+  // subscription is created, so every path here needs a valid add-on price.
+  mockStripe.prices.retrieve.mockResolvedValue({
+    id: "price_123",
+    active: true,
+    type: "recurring",
+    product: {
+      id: "prod_1",
+      deleted: false,
+      active: true,
+      metadata: { product_type: "addon", addon_type: "barcodes" },
+    },
+  });
+  mockPremiumIsEnabled.value = true;
+  mockOrgUpdate.mockResolvedValue({ id: "org_1" });
+});
+
+const baseCheckoutParams = {
+  priceId: "price_123",
+  userId: "user_1",
+  domainUrl: "https://app.shelf.nu",
+  customerId: "cus_123",
+  organizationId: "org_1",
+};
+
+const baseTrialParams = {
+  customerId: "cus_123",
+  priceId: "price_123",
+  userId: "user_1",
+  organizationId: "org_1",
+};
+
+function makeBarcodeProduct(overrides: Partial<Stripe.Product> = {}) {
+  return {
+    id: "prod_barcode",
+    active: true,
+    metadata: { product_type: "addon", addon_type: "barcodes" },
+    ...overrides,
+  };
+}
+
+function makeNonBarcodeProduct() {
+  return {
+    id: "prod_other",
+    active: true,
+    metadata: { product_type: "plan", addon_type: undefined },
+  };
+}
+
+function makeSubscription(
+  overrides: Partial<Stripe.Subscription> = {}
+): Stripe.Subscription {
+  return {
+    id: "sub_123",
+    status: "active",
+    metadata: {},
+    items: {
+      data: [
+        {
+          price: {
+            product: "prod_barcode",
+            recurring: { interval: "month" },
+            unit_amount: 499,
+            currency: "usd",
+          },
+        },
+      ],
+    },
+    ...overrides,
+  } as unknown as Stripe.Subscription;
+}
+
+describe("createBarcodeAddonCheckoutSession", () => {
+  it("creates checkout session with correct params and returns URL", async () => {
+    mockStripe.checkout.sessions.create.mockResolvedValue({
+      url: "https://checkout.stripe.com/session_123",
+    });
+
+    const url = await createBarcodeAddonCheckoutSession(baseCheckoutParams);
+
+    expect(url).toBe("https://checkout.stripe.com/session_123");
+    expect(mockStripe.checkout.sessions.create).toHaveBeenCalledWith({
+      mode: "subscription",
+      payment_method_types: ["card"],
+      line_items: [{ price: "price_123", quantity: 1 }],
+      success_url: "https://app.shelf.nu/assets?success=true&addon=barcodes",
+      cancel_url: "https://app.shelf.nu/assets?canceled=true&addon=barcodes",
+      client_reference_id: "user_1",
+      customer: "cus_123",
+      subscription_data: {
+        metadata: { organizationId: "org_1" },
+      },
+    });
+  });
+
+  it("throws ShelfError when stripe is not initialized", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+
+    try {
+      await createBarcodeAddonCheckoutSession(baseCheckoutParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+
+  it("throws ShelfError when session URL is null", async () => {
+    mockStripe.checkout.sessions.create.mockResolvedValue({ url: null });
+
+    try {
+      await createBarcodeAddonCheckoutSession(baseCheckoutParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+    }
+  });
+});
+
+describe("createBarcodeAddonTrialSubscription", () => {
+  it("creates 7-day trial subscription with default_payment_method when PM available", async () => {
+    mockStripe.paymentMethods.list.mockResolvedValue({
+      data: [{ id: "pm_123" }],
+    });
+    const mockSub = makeSubscription({ status: "trialing" as any });
+    mockStripe.subscriptions.create.mockResolvedValue(mockSub);
+
+    await createBarcodeAddonTrialSubscription(baseTrialParams);
+
+    expect(mockStripe.subscriptions.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trial_period_days: 7,
+        default_payment_method: "pm_123",
+      }),
+      // Keyed on the workspace: a retry after a lost response returns this
+      // same subscription instead of opening a second one.
+      { idempotencyKey: "addon-trial:barcodes:org_1" }
+    );
+  });
+
+  it("creates subscription without default_payment_method when none exists", async () => {
+    mockStripe.paymentMethods.list.mockResolvedValue({ data: [] });
+    mockStripe.subscriptions.create.mockResolvedValue(
+      makeSubscription({ status: "trialing" as any })
+    );
+
+    await createBarcodeAddonTrialSubscription(baseTrialParams);
+
+    const callArgs = mockStripe.subscriptions.create.mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("default_payment_method");
+  });
+
+  it("returns { subscription, hasPaymentMethod: true } when PM exists", async () => {
+    mockStripe.paymentMethods.list.mockResolvedValue({
+      data: [{ id: "pm_123" }],
+    });
+    const mockSub = makeSubscription({ status: "trialing" as any });
+    mockStripe.subscriptions.create.mockResolvedValue(mockSub);
+
+    const result = await createBarcodeAddonTrialSubscription(baseTrialParams);
+
+    expect(result.subscription).toBe(mockSub);
+    expect(result.hasPaymentMethod).toBe(true);
+  });
+
+  it("returns { subscription, hasPaymentMethod: false } when no PM", async () => {
+    mockStripe.paymentMethods.list.mockResolvedValue({ data: [] });
+    const mockSub = makeSubscription({ status: "trialing" as any });
+    mockStripe.subscriptions.create.mockResolvedValue(mockSub);
+
+    const result = await createBarcodeAddonTrialSubscription(baseTrialParams);
+
+    expect(result.subscription).toBe(mockSub);
+    expect(result.hasPaymentMethod).toBe(false);
+  });
+
+  it("throws ShelfError when stripe is not initialized", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+
+    try {
+      await createBarcodeAddonTrialSubscription(baseTrialParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+});
+
+describe("getBarcodeAddonPrices", () => {
+  it("returns { month: null, year: null } when premiumIsEnabled is false", async () => {
+    mockPremiumIsEnabled.value = false;
+
+    const result = await getBarcodeAddonPrices();
+
+    expect(result).toEqual({ month: null, year: null });
+    expect(mockStripe.prices.list).not.toHaveBeenCalled();
+  });
+
+  it("returns { month: null, year: null } when stripe is null", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+
+    try {
+      const result = await getBarcodeAddonPrices();
+      expect(result).toEqual({ month: null, year: null });
+      expect(mockStripe.prices.list).not.toHaveBeenCalled();
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+
+  it("returns monthly and yearly prices filtered by barcode addon metadata", async () => {
+    const monthlyPrice = {
+      id: "price_month",
+      recurring: { interval: "month" },
+      product: makeBarcodeProduct(),
+    };
+    const yearlyPrice = {
+      id: "price_year",
+      recurring: { interval: "year" },
+      product: makeBarcodeProduct(),
+    };
+    const otherPrice = {
+      id: "price_other",
+      recurring: { interval: "month" },
+      product: makeNonBarcodeProduct(),
+    };
+
+    mockStripe.prices.list.mockResolvedValue({
+      data: [monthlyPrice, yearlyPrice, otherPrice],
+    });
+
+    const result = await getBarcodeAddonPrices();
+
+    expect(result.month).toBe(monthlyPrice);
+    expect(result.year).toBe(yearlyPrice);
+  });
+
+  it("returns null for missing intervals", async () => {
+    const monthlyPrice = {
+      id: "price_month",
+      recurring: { interval: "month" },
+      product: makeBarcodeProduct(),
+    };
+
+    mockStripe.prices.list.mockResolvedValue({
+      data: [monthlyPrice],
+    });
+
+    const result = await getBarcodeAddonPrices();
+
+    expect(result.month).toBe(monthlyPrice);
+    expect(result.year).toBeNull();
+  });
+});
+
+describe("linkBarcodeAddonToOrganization", () => {
+  const linkParams = { customerId: "cus_123", organizationId: "org_1" };
+
+  it("finds active barcode subscription and updates metadata with organizationId", async () => {
+    const sub = makeSubscription({
+      id: "sub_barcode",
+      metadata: { existing: "data" } as any,
+    });
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue(makeBarcodeProduct());
+    mockOrgUpdate.mockResolvedValue({ id: "org_1" });
+
+    await linkBarcodeAddonToOrganization(linkParams);
+
+    expect(mockStripe.subscriptions.update).toHaveBeenCalledWith(
+      "sub_barcode",
+      {
+        metadata: { existing: "data", organizationId: "org_1" },
+      }
+    );
+  });
+
+  it("enables barcodesEnabled on the organization", async () => {
+    const sub = makeSubscription({ status: "active" as any });
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue(makeBarcodeProduct());
+    mockOrgUpdate.mockResolvedValue({ id: "org_1" });
+
+    await linkBarcodeAddonToOrganization(linkParams);
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "org_1" },
+        data: expect.objectContaining({
+          barcodesEnabled: true,
+          barcodesEnabledAt: expect.any(Date),
+        }),
+      })
+    );
+  });
+
+  it("sets usedBarcodeTrial when subscription is trialing", async () => {
+    const sub = makeSubscription({ status: "trialing" as any });
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue(makeBarcodeProduct());
+    mockOrgUpdate.mockResolvedValue({ id: "org_1" });
+
+    await linkBarcodeAddonToOrganization(linkParams);
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          usedBarcodeTrial: true,
+        }),
+      })
+    );
+  });
+
+  it("does not set usedBarcodeTrial when subscription is active", async () => {
+    const sub = makeSubscription({ status: "active" as any });
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue(makeBarcodeProduct());
+    mockOrgUpdate.mockResolvedValue({ id: "org_1" });
+
+    await linkBarcodeAddonToOrganization(linkParams);
+
+    const updateData = mockOrgUpdate.mock.calls[0][0].data;
+    expect(updateData).not.toHaveProperty("usedBarcodeTrial");
+  });
+
+  it("skips subscriptions already linked to another organization", async () => {
+    const linkedSub = makeSubscription({
+      id: "sub_linked",
+      status: "active" as any,
+      metadata: { organizationId: "org_other" } as any,
+    });
+    const unlinkedSub = makeSubscription({
+      id: "sub_unlinked",
+      status: "active" as any,
+      metadata: {} as any,
+    });
+    mockStripe.subscriptions.list.mockResolvedValue({
+      data: [linkedSub, unlinkedSub],
+    });
+    mockStripe.products.retrieve.mockResolvedValue(makeBarcodeProduct());
+    mockOrgUpdate.mockResolvedValue({ id: "org_1" });
+
+    await linkBarcodeAddonToOrganization(linkParams);
+
+    expect(mockStripe.subscriptions.update).toHaveBeenCalledWith(
+      "sub_unlinked",
+      expect.objectContaining({
+        metadata: expect.objectContaining({ organizationId: "org_1" }),
+      })
+    );
+  });
+
+  it("allows linking when subscription is already linked to the same org", async () => {
+    const sub = makeSubscription({
+      id: "sub_same_org",
+      status: "active" as any,
+      metadata: { organizationId: "org_1" } as any,
+    });
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue(makeBarcodeProduct());
+    mockOrgUpdate.mockResolvedValue({ id: "org_1" });
+
+    await linkBarcodeAddonToOrganization(linkParams);
+
+    expect(mockStripe.subscriptions.update).toHaveBeenCalledWith(
+      "sub_same_org",
+      expect.objectContaining({
+        metadata: expect.objectContaining({ organizationId: "org_1" }),
+      })
+    );
+    expect(mockOrgUpdate).toHaveBeenCalled();
+  });
+
+  it("throws when no barcode subscription found", async () => {
+    const sub = makeSubscription({ status: "active" as any });
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue(makeNonBarcodeProduct());
+
+    try {
+      await linkBarcodeAddonToOrganization(linkParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+    }
+  });
+
+  it("throws ShelfError when stripe is not initialized", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+
+    try {
+      await linkBarcodeAddonToOrganization(linkParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+});
+
+describe("getBarcodeSubscriptionInfo", () => {
+  it("returns interval/amount/currency/status for active subscription", async () => {
+    const sub = makeSubscription({
+      status: "active" as any,
+      items: {
+        data: [
+          {
+            price: {
+              product: "prod_barcode",
+              recurring: { interval: "month" },
+              unit_amount: 499,
+              currency: "usd",
+            },
+          },
+        ],
+      } as any,
+    });
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue(makeBarcodeProduct());
+
+    const result = await getBarcodeSubscriptionInfo({
+      customerId: "cus_123",
+    });
+
+    expect(result).toEqual({
+      interval: "month",
+      amount: 499,
+      currency: "usd",
+      status: "active",
+    });
+  });
+
+  it("returns null when stripe is not initialized", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+
+    try {
+      const result = await getBarcodeSubscriptionInfo({
+        customerId: "cus_123",
+      });
+      expect(result).toBeNull();
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+
+  it("returns null when no subscription found", async () => {
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [] });
+
+    const result = await getBarcodeSubscriptionInfo({
+      customerId: "cus_123",
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("returns null silently on errors", async () => {
+    mockStripe.subscriptions.list.mockRejectedValue(new Error("API error"));
+
+    const result = await getBarcodeSubscriptionInfo({
+      customerId: "cus_123",
+    });
+
+    expect(result).toBeNull();
+  });
+});
+
+describe("handleBarcodeAddonWebhook", () => {
+  beforeEach(() => {
+    mockHasOtherActiveAddonSubscription.mockResolvedValue(false);
+  });
+
+  it("checkout.session.completed enables barcodesEnabled + barcodesEnabledAt", async () => {
+    await handleBarcodeAddonWebhook({
+      eventType: "checkout.session.completed",
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "org_1" },
+        data: expect.objectContaining({
+          barcodesEnabled: true,
+          barcodesEnabledAt: expect.any(Date),
+        }),
+      })
+    );
+  });
+
+  it("subscription.created enables barcodes + marks usedBarcodeTrial for trials", async () => {
+    const sub = makeSubscription({
+      trial_start: 1000,
+      trial_end: 2000,
+      metadata: {},
+    } as any);
+
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.created",
+      subscription: sub,
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          barcodesEnabled: true,
+          usedBarcodeTrial: true,
+        }),
+      })
+    );
+  });
+
+  it("subscription.created skips usedBarcodeTrial for transferred subscriptions", async () => {
+    const sub = makeSubscription({
+      trial_start: 1000,
+      trial_end: 2000,
+      metadata: { transferred_from_subscription: "sub_old" },
+    } as any);
+
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.created",
+      subscription: sub,
+      organizationId: "org_1",
+    });
+
+    const updateData = mockOrgUpdate.mock.calls[0][0].data;
+    expect(updateData).not.toHaveProperty("usedBarcodeTrial");
+    expect(updateData.barcodesEnabled).toBe(true);
+  });
+
+  it("subscription.updated (active) enables barcodes", async () => {
+    const sub = makeSubscription({ status: "active" as any });
+
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: sub,
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { barcodesEnabled: true },
+      })
+    );
+  });
+
+  it("subscription.updated (canceled) disables barcodes", async () => {
+    const sub = makeSubscription({ status: "canceled" as any });
+
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: sub,
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { barcodesEnabled: false },
+      })
+    );
+  });
+
+  it("subscription.paused disables barcodes", async () => {
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.paused",
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { barcodesEnabled: false },
+      })
+    );
+  });
+
+  it("subscription.deleted disables barcodes", async () => {
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.deleted",
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: { barcodesEnabled: false },
+      })
+    );
+  });
+
+  it("subscription.updated (past_due) leaves the add-on as it is", async () => {
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: {
+        id: "sub_1",
+        customer: "cus_xyz",
+        status: "past_due",
+      } as any,
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("invoice.overdue switches the add-on off", async () => {
+    await handleBarcodeAddonWebhook({
+      eventType: "invoice.overdue",
+      subscription: {
+        id: "sub_1",
+        customer: "cus_xyz",
+        status: "past_due",
+      } as any,
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith({
+      where: { id: "org_1" },
+      data: { barcodesEnabled: false },
+      select: { id: true },
+    });
+  });
+
+  it("invoice.overdue keeps the add-on on while another live subscription carries it", async () => {
+    mockHasOtherActiveAddonSubscription.mockResolvedValue(true);
+
+    await handleBarcodeAddonWebhook({
+      eventType: "invoice.overdue",
+      subscription: {
+        id: "sub_1",
+        customer: "cus_xyz",
+        status: "past_due",
+      } as any,
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("unknown event makes no database call", async () => {
+    await handleBarcodeAddonWebhook({
+      eventType: "some.unknown.event",
+      organizationId: "org_1",
+    });
+
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("keeps barcodes on when another live subscription still carries the add-on for this workspace", async () => {
+    mockHasOtherActiveAddonSubscription.mockResolvedValue(true);
+
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.paused",
+      subscription: {
+        id: "sub_bundled",
+        customer: "cus_1",
+        status: "paused",
+      } as any,
+      organizationId: "org_1",
+    });
+
+    expect(mockHasOtherActiveAddonSubscription).toHaveBeenCalledWith({
+      customerId: "cus_1",
+      organizationId: "org_1",
+      addonType: "barcodes",
+      exceptSubscriptionId: "sub_bundled",
+    });
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("keeps barcodes on through an inactive status change while another subscription covers it", async () => {
+    mockHasOtherActiveAddonSubscription.mockResolvedValue(true);
+
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: {
+        id: "sub_bundled",
+        customer: { id: "cus_1" },
+        status: "canceled",
+      } as any,
+      organizationId: "org_1",
+    });
+
+    expect(mockHasOtherActiveAddonSubscription).toHaveBeenCalledWith(
+      expect.objectContaining({ customerId: "cus_1" })
+    );
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not consult other subscriptions when the status change keeps the add-on active", async () => {
+    await handleBarcodeAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: { id: "sub_1", customer: "cus_1", status: "active" } as any,
+      organizationId: "org_1",
+    });
+
+    expect(mockHasOtherActiveAddonSubscription).not.toHaveBeenCalled();
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { barcodesEnabled: true } })
+    );
+  });
+});
+
+describe("add-on price validation (entitlement bypass)", () => {
+  /**
+   * A TIER price is an ordinary active recurring price, so before this guard
+   * it was accepted here. The route enables the feature flag eagerly, and the
+   * resulting subscription carries a tierId — which makes `isAddonSubscription`
+   * return false, so the add-on webhook that would clear the flag never runs.
+   * Net effect: a one-time 7-day trial granted the paid feature permanently.
+   *
+   * detail.dev finding D094.
+   */
+  it("surfaces the price-validation message, not the generic wrapper text", async () => {
+    // The wrapping catch used to rewrite every failure to "Please try again
+    // later", handing back a 400 that asks the user to retry a request which
+    // can never succeed.
+    mockStripe.prices.retrieve.mockResolvedValue({
+      id: "price_tier",
+      active: true,
+      type: "recurring",
+      product: {
+        id: "prod_tier",
+        deleted: false,
+        active: true,
+        metadata: { shelf_tier: "tier_2" },
+      },
+    });
+
+    await expect(
+      createBarcodeAddonTrialSubscription({
+        customerId: "cus_123",
+        priceId: "price_tier",
+        userId: "user_1",
+        organizationId: "org_1",
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      message: "The selected plan is not available for this add-on.",
+    });
+  });
+
+  it("refuses a tier price and never creates a subscription", async () => {
+    mockStripe.prices.retrieve.mockResolvedValue({
+      id: "price_tier",
+      active: true,
+      type: "recurring",
+      product: {
+        id: "prod_tier",
+        deleted: false,
+        active: true,
+        metadata: { shelf_tier: "tier_2" },
+      },
+    });
+
+    await expect(
+      createBarcodeAddonTrialSubscription({
+        ...baseTrialParams,
+        priceId: "price_tier",
+      })
+    ).rejects.toBeInstanceOf(ShelfError);
+
+    expect(mockStripe.subscriptions.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a tier price on the checkout path too", async () => {
+    mockStripe.prices.retrieve.mockResolvedValue({
+      id: "price_tier",
+      active: true,
+      type: "recurring",
+      product: {
+        id: "prod_tier",
+        deleted: false,
+        active: true,
+        metadata: { shelf_tier: "tier_2" },
+      },
+    });
+
+    await expect(
+      createBarcodeAddonCheckoutSession({
+        ...baseCheckoutParams,
+        priceId: "price_tier",
+      })
+    ).rejects.toBeInstanceOf(ShelfError);
+
+    expect(mockStripe.checkout.sessions.create).not.toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,518 @@
+import Markdoc from "@markdoc/markdoc";
+import { Decimal } from "@prisma/client/runtime/library";
+import { describe, expect, it } from "vitest";
+import { URL_SHAPED_VALUE, expectValueOnlyInTag } from "@helpers/note-tags";
+
+import { wrapUserLinkForNote } from "~/utils/markdoc-wrappers";
+import {
+  buildAssetModelChangeNote,
+  buildAvailableToBookChangeNote,
+  buildCategoryChangeNote,
+  buildDescriptionChangeNote,
+  buildNameChangeNote,
+  buildValuationChangeNote,
+  normalizeText,
+  toNullableNumber,
+} from "./helpers.server";
+
+const userLink = '{% user id="user-1" /%}';
+
+describe("normalizeText", () => {
+  it("returns null for null input", () => {
+    expect(normalizeText(null)).toBeNull();
+  });
+
+  it("returns null for undefined input", () => {
+    expect(normalizeText(undefined)).toBeNull();
+  });
+
+  it("returns null for empty string", () => {
+    expect(normalizeText("")).toBeNull();
+  });
+
+  it("returns null for whitespace-only string", () => {
+    expect(normalizeText("   ")).toBeNull();
+    expect(normalizeText("\t\n")).toBeNull();
+  });
+
+  it("returns trimmed string for valid text", () => {
+    expect(normalizeText("  hello  ")).toBe("hello");
+    expect(normalizeText("test")).toBe("test");
+  });
+
+  it("returns null for non-string values", () => {
+    expect(normalizeText(123 as any)).toBeNull();
+    expect(normalizeText({} as any)).toBeNull();
+  });
+});
+
+describe("buildNameChangeNote", () => {
+  it("returns null when names are identical", () => {
+    expect(
+      buildNameChangeNote({
+        userLink,
+        previous: "Test Asset",
+        next: "Test Asset",
+      })
+    ).toBeNull();
+  });
+
+  it("returns null when previous name is missing", () => {
+    expect(
+      buildNameChangeNote({ userLink, previous: null, next: "New Name" })
+    ).toBeNull();
+  });
+
+  it("returns null when next name is missing", () => {
+    expect(
+      buildNameChangeNote({ userLink, previous: "Old Name", next: null })
+    ).toBeNull();
+  });
+
+  it("returns null when both names are empty strings", () => {
+    expect(
+      buildNameChangeNote({ userLink, previous: "", next: "" })
+    ).toBeNull();
+  });
+
+  it("builds note for name change", () => {
+    const result = buildNameChangeNote({
+      userLink,
+      previous: "Old Asset",
+      next: "New Asset",
+    });
+
+    expect(result).toBe(
+      `${userLink} updated the asset name from {% name text="Old Asset" /%} to {% name text="New Asset" /%}.`
+    );
+  });
+
+  it("keeps markdown special characters as typed inside the name tags", () => {
+    const result = buildNameChangeNote({
+      userLink,
+      previous: "Asset*with*stars",
+      next: "Asset_with_underscores",
+    });
+
+    expect(result).toBe(
+      `${userLink} updated the asset name from {% name text="Asset*with*stars" /%} to {% name text="Asset_with_underscores" /%}.`
+    );
+  });
+
+  it("keeps a URL-shaped name inside a name tag", () => {
+    const result = buildNameChangeNote({
+      userLink,
+      previous: "Old Asset",
+      next: URL_SHAPED_VALUE,
+    })!;
+
+    expectValueOnlyInTag(result, URL_SHAPED_VALUE, ["name"]);
+  });
+
+  it("handles names with whitespace trimming", () => {
+    const result = buildNameChangeNote({
+      userLink,
+      previous: "  Old  ",
+      next: "  New  ",
+    });
+
+    expect(result).toBe(
+      `${userLink} updated the asset name from {% name text="Old" /%} to {% name text="New" /%}.`
+    );
+  });
+});
+
+describe("buildCategoryChangeNote", () => {
+  it("returns null when categories have the same ID", () => {
+    expect(
+      buildCategoryChangeNote({
+        userLink,
+        previous: { id: "1", name: "Electronics", color: "#FF0000" },
+        next: { id: "1", name: "Electronics", color: "#FF0000" },
+      })
+    ).toBeNull();
+  });
+
+  it("returns null when both categories are null", () => {
+    expect(
+      buildCategoryChangeNote({
+        userLink,
+        previous: null,
+        next: null,
+      })
+    ).toBeNull();
+  });
+
+  it("builds note for setting first category", () => {
+    const result = buildCategoryChangeNote({
+      userLink,
+      previous: null,
+      next: { id: "1", name: "Electronics", color: "#FF0000" },
+    });
+
+    expect(result).toContain("set the asset category to");
+    expect(result).toContain("category_badge");
+  });
+
+  it("builds note for removing category", () => {
+    const result = buildCategoryChangeNote({
+      userLink,
+      previous: { id: "1", name: "Electronics", color: "#FF0000" },
+      next: null,
+    });
+
+    expect(result).toContain("removed the asset category");
+    expect(result).toContain("category_badge");
+    expect(result).toContain("Electronics");
+  });
+
+  it("builds note for changing category", () => {
+    const result = buildCategoryChangeNote({
+      userLink,
+      previous: { id: "1", name: "Electronics", color: "#FF0000" },
+      next: { id: "2", name: "Furniture", color: "#00FF00" },
+    });
+
+    expect(result).toContain("changed the asset category from");
+    expect(result).toContain("category_badge");
+  });
+});
+
+describe("buildDescriptionChangeNote", () => {
+  it("returns null when description did not change", () => {
+    expect(
+      buildDescriptionChangeNote({ userLink, previous: "Test", next: "Test" })
+    ).toBeNull();
+  });
+
+  it("describes adding the first description", () => {
+    const result = buildDescriptionChangeNote({
+      userLink,
+      previous: null,
+      next: "New details",
+    });
+
+    expect(result).toBe(
+      `${userLink} added an asset description {% description newText="New details" /%}.`
+    );
+  });
+
+  it("describes removing an existing description", () => {
+    const result = buildDescriptionChangeNote({
+      userLink,
+      previous: "Old details",
+      next: "",
+    });
+
+    expect(result).toBe(
+      `${userLink} removed the asset description {% description oldText="Old details" /%}.`
+    );
+  });
+
+  it("renders updates between two descriptions", () => {
+    const result = buildDescriptionChangeNote({
+      userLink,
+      previous: "Old description",
+      next: "Updated description",
+    });
+
+    expect(result).toBe(
+      `${userLink} updated the asset description {% description oldText="Old description" newText="Updated description" /%}.`
+    );
+  });
+
+  it("keeps both descriptions whole at the 5,000 character limit", () => {
+    const previous = `${"a".repeat(4999)}"`;
+    const next = "b".repeat(5000);
+
+    const result = buildDescriptionChangeNote({ userLink, previous, next });
+    const attributes = [...Markdoc.parse(result ?? "").walk()].find(
+      (node) => node.type === "tag" && node.tag === "description"
+    )?.attributes;
+
+    expect(attributes?.oldText).toBe(`${"a".repeat(4999)}&quot;`);
+    expect(attributes?.newText).toBe(next);
+  });
+
+  it("treats whitespace-only as no description", () => {
+    const result = buildDescriptionChangeNote({
+      userLink,
+      previous: "Old",
+      next: "   ",
+    });
+
+    expect(result).toContain("removed the asset description");
+  });
+});
+
+describe("toNullableNumber", () => {
+  it("returns null for null input", () => {
+    expect(toNullableNumber(null)).toBeNull();
+  });
+
+  it("returns null for undefined input", () => {
+    expect(toNullableNumber(undefined)).toBeNull();
+  });
+
+  it("converts regular numbers", () => {
+    expect(toNullableNumber(42)).toBe(42);
+    expect(toNullableNumber(0)).toBe(0);
+    expect(toNullableNumber(-10.5)).toBe(-10.5);
+  });
+
+  it("converts numeric strings", () => {
+    expect(toNullableNumber("42")).toBe(42);
+    expect(toNullableNumber("3.14")).toBe(3.14);
+  });
+
+  it("returns null for invalid values", () => {
+    expect(toNullableNumber("not a number")).toBeNull();
+    expect(toNullableNumber(NaN)).toBeNull();
+    expect(toNullableNumber(Infinity)).toBeNull();
+    expect(toNullableNumber(-Infinity)).toBeNull();
+  });
+
+  it("converts Prisma Decimal to number", () => {
+    const decimal = new Decimal("123.45");
+    expect(toNullableNumber(decimal)).toBe(123.45);
+  });
+
+  it("handles Prisma Decimal edge cases", () => {
+    const zero = new Decimal(0);
+    expect(toNullableNumber(zero)).toBe(0);
+
+    const negative = new Decimal("-99.99");
+    expect(toNullableNumber(negative)).toBe(-99.99);
+  });
+
+  it("returns null for objects without toNumber method", () => {
+    expect(toNullableNumber({})).toBeNull();
+    expect(toNullableNumber({ value: 42 })).toBeNull();
+  });
+});
+
+describe("buildValuationChangeNote", () => {
+  const currency = "USD" as any;
+  const locale = "en-US";
+
+  it("returns null when valuations are identical", () => {
+    expect(
+      buildValuationChangeNote({
+        userLink,
+        previous: 100,
+        next: 100,
+        currency,
+        locale,
+      })
+    ).toBeNull();
+  });
+
+  it("builds note for setting first valuation", () => {
+    const result = buildValuationChangeNote({
+      userLink,
+      previous: null,
+      next: 500,
+      currency,
+      locale,
+    });
+
+    expect(result).toContain("set the asset value to");
+    expect(result).toContain("$");
+  });
+
+  it("builds note for removing valuation", () => {
+    const result = buildValuationChangeNote({
+      userLink,
+      previous: 500,
+      next: null,
+      currency,
+      locale,
+    });
+
+    expect(result).toBe(`${userLink} removed the asset value.`);
+  });
+
+  it("builds note for changing valuation", () => {
+    const result = buildValuationChangeNote({
+      userLink,
+      previous: 100,
+      next: 200,
+      currency,
+      locale,
+    });
+
+    expect(result).toContain("changed the asset value from");
+    expect(result).toContain("$100");
+    expect(result).toContain("$200");
+  });
+
+  it("handles Prisma Decimal values", () => {
+    const result = buildValuationChangeNote({
+      userLink,
+      previous: new Decimal("99.99"),
+      next: new Decimal("199.99"),
+      currency,
+      locale,
+    });
+
+    expect(result).toContain("changed the asset value from");
+  });
+
+  it("returns null when both values are zero", () => {
+    expect(
+      buildValuationChangeNote({
+        userLink,
+        previous: 0,
+        next: 0,
+        currency,
+        locale,
+      })
+    ).toBeNull();
+  });
+
+  it("handles change from zero to positive value", () => {
+    const result = buildValuationChangeNote({
+      userLink,
+      previous: 0,
+      next: 100,
+      currency,
+      locale,
+    });
+
+    expect(result).toContain("changed the asset value from");
+  });
+});
+
+describe("buildAssetModelChangeNote", () => {
+  const userLink = '{% link to="/u/1" text="Dana" /%}';
+  const streamDeck = { id: "am-1", name: "Stream Deck XL" };
+  const amaran = { id: "am-2", name: "Amaran 300C" };
+
+  it("names both sides when the model changes", () => {
+    const note = buildAssetModelChangeNote({
+      userLink,
+      previous: streamDeck,
+      next: amaran,
+    });
+
+    expect(note).toContain("changed the asset model");
+    expect(note).toContain("Stream Deck XL");
+    expect(note).toContain("Amaran 300C");
+  });
+
+  it("reads as setting when there was no model before", () => {
+    expect(
+      buildAssetModelChangeNote({ userLink, previous: null, next: streamDeck })
+    ).toContain("set the asset model to");
+  });
+
+  it("reads as removing when the model is cleared", () => {
+    expect(
+      buildAssetModelChangeNote({ userLink, previous: streamDeck, next: null })
+    ).toContain("removed the asset model");
+  });
+
+  it("writes nothing when the model did not change", () => {
+    expect(
+      buildAssetModelChangeNote({
+        userLink,
+        previous: streamDeck,
+        next: { ...streamDeck },
+      })
+    ).toBeNull();
+    expect(
+      buildAssetModelChangeNote({ userLink, previous: null, next: null })
+    ).toBeNull();
+  });
+
+  it("names the deletion when the model itself is gone", () => {
+    // Deleting a model unlinks every asset it held. The asset's history has to
+    // say so, or the model simply vanishes from the asset with no explanation.
+    const note = buildAssetModelChangeNote({
+      userLink,
+      previous: streamDeck,
+      next: null,
+      previousDeleted: true,
+    })!;
+
+    expect(note).toContain("deleted the asset model");
+    expect(note).toContain("Stream Deck XL");
+    // No link: the model's page is gone, so linking to it would 404.
+    expect(note).not.toContain("/settings/asset-models/");
+  });
+
+  it("cannot be used to inject a Markdoc tag through a deleted model's name", () => {
+    // The deleted-model branch renders the name in a `name` tag rather than a
+    // link, so it is checked on its own.
+    const note = buildAssetModelChangeNote({
+      userLink,
+      previous: { id: "am-4", name: '{% booking_status status="APPROVED" /%}' },
+      next: null,
+      previousDeleted: true,
+    })!;
+
+    const tags = [...Markdoc.parse(note).walk()].filter(
+      (node) => node.type === "tag" && node.tag === "booking_status"
+    );
+    expect(tags).toHaveLength(0);
+  });
+
+  it("keeps a URL-shaped deleted model's name inside a name tag", () => {
+    const note = buildAssetModelChangeNote({
+      userLink,
+      previous: { id: "am-5", name: URL_SHAPED_VALUE },
+      next: null,
+      previousDeleted: true,
+    })!;
+
+    expectValueOnlyInTag(note, URL_SHAPED_VALUE, ["name"]);
+  });
+
+  it("cannot be used to inject a Markdoc tag through the model name", () => {
+    // Model names are user-authored and spliced into note content, which the
+    // feed renders as Markdoc. See sanitize-note-content-markdoc.
+    const note = buildAssetModelChangeNote({
+      userLink,
+      previous: null,
+      next: { id: "am-3", name: '{% booking_status status="APPROVED" /%}' },
+    })!;
+
+    const tags = [...Markdoc.parse(note).walk()].filter(
+      (node) => node.type === "tag" && node.tag === "booking_status"
+    );
+    expect(tags).toHaveLength(0);
+  });
+});
+
+describe("buildAvailableToBookChangeNote", () => {
+  it("names the switch being turned on", () => {
+    expect(
+      buildAvailableToBookChangeNote({ userLink, availableToBook: true })
+    ).toBe(`${userLink} marked the asset as available for bookings.`);
+  });
+
+  it("names the switch being turned off", () => {
+    expect(
+      buildAvailableToBookChangeNote({ userLink, availableToBook: false })
+    ).toBe(`${userLink} marked the asset as unavailable for bookings.`);
+  });
+
+  it("renders only the actor's link, whatever the actor's display name holds", () => {
+    // The display name is the one user-chosen value in this note. It travels
+    // inside the link's quoted attribute, so a tag typed into it stays text.
+    const note = buildAvailableToBookChangeNote({
+      userLink: wrapUserLinkForNote({
+        id: "user-1",
+        firstName: null,
+        lastName: null,
+        displayName: '{% booking_status status="APPROVED" /%}',
+      }),
+      availableToBook: true,
+    });
+
+    const tags = [...Markdoc.parse(note).walk()]
+      .filter((node) => node.type === "tag")
+      .map((node) => node.tag);
+    expect(tags).toEqual(["link"]);
+  });
+});

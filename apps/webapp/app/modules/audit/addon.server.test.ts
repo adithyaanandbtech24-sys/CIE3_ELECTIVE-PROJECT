@@ -1,0 +1,889 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+
+// why: Stripe SDK makes external API calls
+const { mockStripe } = vi.hoisted(() => ({
+  mockStripe: {
+    checkout: { sessions: { create: vi.fn() } },
+    subscriptions: { create: vi.fn(), list: vi.fn(), update: vi.fn() },
+    prices: { list: vi.fn(), retrieve: vi.fn() },
+    products: { retrieve: vi.fn() },
+    paymentMethods: { list: vi.fn() },
+  },
+}));
+
+// why: control premiumIsEnabled flag
+const { mockPremiumIsEnabled } = vi.hoisted(() => ({
+  mockPremiumIsEnabled: { value: true },
+}));
+
+// why: the other-subscription check is a Stripe round trip of its own; each
+// test states whether another live subscription still carries the add-on
+const { mockHasOtherActiveAddonSubscription } = vi.hoisted(() => ({
+  mockHasOtherActiveAddonSubscription: vi.fn(),
+}));
+
+vi.mock("~/utils/stripe.server", () => ({
+  stripe: mockStripe,
+  customerHasOtherActiveAddonSubscription: mockHasOtherActiveAddonSubscription,
+  get premiumIsEnabled() {
+    return mockPremiumIsEnabled.value;
+  },
+}));
+
+// why: Database module connects to Prisma during import
+const { mockOrgUpdate } = vi.hoisted(() => ({
+  mockOrgUpdate: vi.fn(),
+}));
+
+vi.mock("~/database/db.server", () => ({
+  db: {
+    organization: {
+      update: mockOrgUpdate,
+    },
+  },
+}));
+
+import { ShelfError } from "~/utils/error";
+import {
+  createAuditAddonCheckoutSession,
+  createAuditAddonTrialSubscription,
+  getAuditAddonPrices,
+  linkAuditAddonToOrganization,
+  getAuditSubscriptionInfo,
+  handleAuditAddonWebhook,
+} from "./addon.server";
+
+const baseParams = {
+  priceId: "price_123",
+  userId: "user_abc",
+  domainUrl: "https://app.shelf.nu",
+  customerId: "cus_xyz",
+  organizationId: "org_456",
+};
+
+beforeEach(() => {
+  vi.clearAllMocks();
+  // why: `assertPriceIsForAddon` resolves the price server-side before any
+  // subscription is created, so every path here needs a valid add-on price.
+  mockStripe.prices.retrieve.mockResolvedValue({
+    id: "price_123",
+    active: true,
+    type: "recurring",
+    product: {
+      id: "prod_1",
+      deleted: false,
+      active: true,
+      metadata: { product_type: "addon", addon_type: "audits" },
+    },
+  });
+  mockPremiumIsEnabled.value = true;
+});
+
+describe("createAuditAddonCheckoutSession", () => {
+  it("creates checkout session with correct params and returns URL", async () => {
+    mockStripe.checkout.sessions.create.mockResolvedValue({
+      url: "https://checkout.stripe.com/session_abc",
+    });
+
+    const url = await createAuditAddonCheckoutSession(baseParams);
+
+    expect(url).toBe("https://checkout.stripe.com/session_abc");
+    expect(mockStripe.checkout.sessions.create).toHaveBeenCalledWith({
+      mode: "subscription",
+      payment_method_types: ["card"],
+      line_items: [{ price: "price_123", quantity: 1 }],
+      success_url: "https://app.shelf.nu/audits?success=true",
+      cancel_url: "https://app.shelf.nu/audits?canceled=true",
+      client_reference_id: "user_abc",
+      customer: "cus_xyz",
+      subscription_data: {
+        metadata: { organizationId: "org_456" },
+      },
+    });
+  });
+
+  it("throws ShelfError when stripe is not initialized", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+    try {
+      await createAuditAddonCheckoutSession(baseParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+
+  it("throws ShelfError when session URL is null", async () => {
+    mockStripe.checkout.sessions.create.mockResolvedValue({ url: null });
+
+    try {
+      await createAuditAddonCheckoutSession(baseParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+      expect((e as ShelfError).message).toContain(
+        "Something went wrong while creating audit add-on checkout session"
+      );
+    }
+  });
+});
+
+describe("createAuditAddonTrialSubscription", () => {
+  const trialParams = {
+    customerId: "cus_xyz",
+    priceId: "price_123",
+    userId: "user_abc",
+    organizationId: "org_456",
+  };
+
+  it("creates 7-day trial subscription with default_payment_method when PM available", async () => {
+    mockStripe.paymentMethods.list.mockResolvedValue({
+      data: [{ id: "pm_abc" }],
+    });
+    const mockSub = { id: "sub_123", status: "trialing" };
+    mockStripe.subscriptions.create.mockResolvedValue(mockSub);
+
+    await createAuditAddonTrialSubscription(trialParams);
+
+    expect(mockStripe.subscriptions.create).toHaveBeenCalledWith(
+      {
+        customer: "cus_xyz",
+        items: [{ price: "price_123" }],
+        trial_period_days: 7,
+        trial_settings: {
+          end_behavior: { missing_payment_method: "pause" },
+        },
+        default_payment_method: "pm_abc",
+        metadata: { userId: "user_abc", organizationId: "org_456" },
+      },
+      // Keyed on the workspace: a retry after a lost response returns this
+      // same subscription instead of opening a second one.
+      { idempotencyKey: "addon-trial:audits:org_456" }
+    );
+  });
+
+  it("creates subscription without default_payment_method when none exists", async () => {
+    mockStripe.paymentMethods.list.mockResolvedValue({ data: [] });
+    mockStripe.subscriptions.create.mockResolvedValue({
+      id: "sub_123",
+      status: "trialing",
+    });
+
+    await createAuditAddonTrialSubscription(trialParams);
+
+    expect(mockStripe.subscriptions.create).toHaveBeenCalledWith(
+      {
+        customer: "cus_xyz",
+        items: [{ price: "price_123" }],
+        trial_period_days: 7,
+        trial_settings: {
+          end_behavior: { missing_payment_method: "pause" },
+        },
+        metadata: { userId: "user_abc", organizationId: "org_456" },
+      },
+      { idempotencyKey: "addon-trial:audits:org_456" }
+    );
+    // Ensure default_payment_method is NOT in the call
+    const callArgs = mockStripe.subscriptions.create.mock.calls[0][0];
+    expect(callArgs).not.toHaveProperty("default_payment_method");
+  });
+
+  it("returns { subscription, hasPaymentMethod: true } when PM exists", async () => {
+    mockStripe.paymentMethods.list.mockResolvedValue({
+      data: [{ id: "pm_abc" }],
+    });
+    const mockSub = { id: "sub_123", status: "trialing" };
+    mockStripe.subscriptions.create.mockResolvedValue(mockSub);
+
+    const result = await createAuditAddonTrialSubscription(trialParams);
+
+    expect(result).toEqual({ subscription: mockSub, hasPaymentMethod: true });
+  });
+
+  it("returns { subscription, hasPaymentMethod: false } when no PM", async () => {
+    mockStripe.paymentMethods.list.mockResolvedValue({ data: [] });
+    const mockSub = { id: "sub_123", status: "trialing" };
+    mockStripe.subscriptions.create.mockResolvedValue(mockSub);
+
+    const result = await createAuditAddonTrialSubscription(trialParams);
+
+    expect(result).toEqual({ subscription: mockSub, hasPaymentMethod: false });
+  });
+
+  it("throws ShelfError when stripe is not initialized", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+    try {
+      await createAuditAddonTrialSubscription(trialParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+});
+
+describe("getAuditAddonPrices", () => {
+  it("returns { month: null, year: null } when premiumIsEnabled is false", async () => {
+    mockPremiumIsEnabled.value = false;
+
+    const result = await getAuditAddonPrices();
+
+    expect(result).toEqual({ month: null, year: null });
+    expect(mockStripe.prices.list).not.toHaveBeenCalled();
+  });
+
+  it("returns { month: null, year: null } when stripe is null", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+    try {
+      const result = await getAuditAddonPrices();
+      expect(result).toEqual({ month: null, year: null });
+      expect(mockStripe.prices.list).not.toHaveBeenCalled();
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+
+  it("returns monthly and yearly prices filtered by audit addon metadata", async () => {
+    const monthlyPrice = {
+      id: "price_month",
+      recurring: { interval: "month" },
+      product: {
+        active: true,
+        metadata: { product_type: "addon", addon_type: "audits" },
+      },
+    };
+    const yearlyPrice = {
+      id: "price_year",
+      recurring: { interval: "year" },
+      product: {
+        active: true,
+        metadata: { product_type: "addon", addon_type: "audits" },
+      },
+    };
+    const otherPrice = {
+      id: "price_other",
+      recurring: { interval: "month" },
+      product: {
+        active: true,
+        metadata: { product_type: "addon", addon_type: "barcodes" },
+      },
+    };
+
+    mockStripe.prices.list.mockResolvedValue({
+      data: [monthlyPrice, yearlyPrice, otherPrice],
+    });
+
+    const result = await getAuditAddonPrices();
+
+    expect(result).toEqual({ month: monthlyPrice, year: yearlyPrice });
+  });
+
+  it("returns null for missing intervals", async () => {
+    const monthlyPrice = {
+      id: "price_month",
+      recurring: { interval: "month" },
+      product: {
+        active: true,
+        metadata: { product_type: "addon", addon_type: "audits" },
+      },
+    };
+
+    mockStripe.prices.list.mockResolvedValue({
+      data: [monthlyPrice],
+    });
+
+    const result = await getAuditAddonPrices();
+
+    expect(result).toEqual({ month: monthlyPrice, year: null });
+  });
+});
+
+describe("linkAuditAddonToOrganization", () => {
+  const linkParams = {
+    customerId: "cus_xyz",
+    organizationId: "org_456",
+  };
+
+  function makeSubscription(status: string, id = "sub_123") {
+    return {
+      id,
+      status,
+      metadata: {},
+      items: {
+        data: [
+          {
+            price: { product: "prod_audit" },
+          },
+        ],
+      },
+    };
+  }
+
+  it("finds active audit subscription and updates metadata with organizationId", async () => {
+    const sub = makeSubscription("active");
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue({
+      active: true,
+      metadata: { product_type: "addon", addon_type: "audits" },
+    });
+    mockStripe.subscriptions.update.mockResolvedValue({});
+    mockOrgUpdate.mockResolvedValue({ id: "org_456" });
+
+    await linkAuditAddonToOrganization(linkParams);
+
+    expect(mockStripe.subscriptions.update).toHaveBeenCalledWith("sub_123", {
+      metadata: { organizationId: "org_456" },
+    });
+  });
+
+  it("enables auditsEnabled on the organization", async () => {
+    const sub = makeSubscription("active");
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue({
+      active: true,
+      metadata: { product_type: "addon", addon_type: "audits" },
+    });
+    mockStripe.subscriptions.update.mockResolvedValue({});
+    mockOrgUpdate.mockResolvedValue({ id: "org_456" });
+
+    await linkAuditAddonToOrganization(linkParams);
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "org_456" },
+        data: expect.objectContaining({
+          auditsEnabled: true,
+          auditsEnabledAt: expect.any(Date),
+        }),
+      })
+    );
+  });
+
+  it("sets usedAuditTrial when subscription is trialing", async () => {
+    const sub = makeSubscription("trialing");
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue({
+      active: true,
+      metadata: { product_type: "addon", addon_type: "audits" },
+    });
+    mockStripe.subscriptions.update.mockResolvedValue({});
+    mockOrgUpdate.mockResolvedValue({ id: "org_456" });
+
+    await linkAuditAddonToOrganization(linkParams);
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          usedAuditTrial: true,
+        }),
+      })
+    );
+  });
+
+  it("does not set usedAuditTrial when subscription is active", async () => {
+    const sub = makeSubscription("active");
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue({
+      active: true,
+      metadata: { product_type: "addon", addon_type: "audits" },
+    });
+    mockStripe.subscriptions.update.mockResolvedValue({});
+    mockOrgUpdate.mockResolvedValue({ id: "org_456" });
+
+    await linkAuditAddonToOrganization(linkParams);
+
+    const updateData = mockOrgUpdate.mock.calls[0][0].data;
+    expect(updateData).not.toHaveProperty("usedAuditTrial");
+  });
+
+  it("skips subscriptions already linked to another organization", async () => {
+    const linkedSub = {
+      id: "sub_linked",
+      status: "active",
+      metadata: { organizationId: "org_other" },
+      items: { data: [{ price: { product: "prod_audit" } }] },
+    };
+    const unlinkedSub = {
+      id: "sub_unlinked",
+      status: "active",
+      metadata: {},
+      items: { data: [{ price: { product: "prod_audit" } }] },
+    };
+    mockStripe.subscriptions.list.mockResolvedValue({
+      data: [linkedSub, unlinkedSub],
+    });
+    mockStripe.products.retrieve.mockResolvedValue({
+      active: true,
+      metadata: { product_type: "addon", addon_type: "audits" },
+    });
+    mockStripe.subscriptions.update.mockResolvedValue({});
+    mockOrgUpdate.mockResolvedValue({ id: "org_456" });
+
+    await linkAuditAddonToOrganization(linkParams);
+
+    expect(mockStripe.subscriptions.update).toHaveBeenCalledWith(
+      "sub_unlinked",
+      expect.objectContaining({
+        metadata: expect.objectContaining({ organizationId: "org_456" }),
+      })
+    );
+  });
+
+  it("allows linking when subscription is already linked to the same org", async () => {
+    const sub = {
+      id: "sub_same_org",
+      status: "active",
+      metadata: { organizationId: "org_456" },
+      items: { data: [{ price: { product: "prod_audit" } }] },
+    };
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [sub] });
+    mockStripe.products.retrieve.mockResolvedValue({
+      active: true,
+      metadata: { product_type: "addon", addon_type: "audits" },
+    });
+    mockStripe.subscriptions.update.mockResolvedValue({});
+    mockOrgUpdate.mockResolvedValue({ id: "org_456" });
+
+    await linkAuditAddonToOrganization(linkParams);
+
+    expect(mockStripe.subscriptions.update).toHaveBeenCalledWith(
+      "sub_same_org",
+      expect.objectContaining({
+        metadata: expect.objectContaining({ organizationId: "org_456" }),
+      })
+    );
+    expect(mockOrgUpdate).toHaveBeenCalled();
+  });
+
+  it("throws when no audit subscription found", async () => {
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [] });
+
+    try {
+      await linkAuditAddonToOrganization(linkParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+      expect((e as ShelfError).message).toContain(
+        "Something went wrong while linking audit add-on"
+      );
+    }
+  });
+
+  it("throws ShelfError when stripe is not initialized", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+    try {
+      await linkAuditAddonToOrganization(linkParams);
+      expect.fail("Should have thrown");
+    } catch (e) {
+      expect(e).toBeInstanceOf(ShelfError);
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+});
+
+describe("getAuditSubscriptionInfo", () => {
+  it("returns interval/amount/currency/status for active subscription", async () => {
+    mockStripe.subscriptions.list.mockResolvedValue({
+      data: [
+        {
+          status: "active",
+          items: {
+            data: [
+              {
+                price: {
+                  product: "prod_audit",
+                  recurring: { interval: "month" },
+                  unit_amount: 1999,
+                  currency: "usd",
+                },
+              },
+            ],
+          },
+        },
+      ],
+    });
+    mockStripe.products.retrieve.mockResolvedValue({
+      active: true,
+      metadata: { product_type: "addon", addon_type: "audits" },
+    });
+
+    const result = await getAuditSubscriptionInfo({
+      customerId: "cus_xyz",
+    });
+
+    expect(result).toEqual({
+      interval: "month",
+      amount: 1999,
+      currency: "usd",
+      status: "active",
+    });
+  });
+
+  it("returns null when stripe is not initialized", async () => {
+    const stripeMod = await import("~/utils/stripe.server");
+    const original = stripeMod.stripe;
+    (stripeMod as any).stripe = null;
+    try {
+      const result = await getAuditSubscriptionInfo({
+        customerId: "cus_xyz",
+      });
+      expect(result).toBeNull();
+    } finally {
+      (stripeMod as any).stripe = original;
+    }
+  });
+
+  it("returns null when no subscription found", async () => {
+    mockStripe.subscriptions.list.mockResolvedValue({ data: [] });
+
+    const result = await getAuditSubscriptionInfo({
+      customerId: "cus_xyz",
+    });
+
+    expect(result).toBeNull();
+  });
+
+  it("returns null silently on errors", async () => {
+    mockStripe.subscriptions.list.mockRejectedValue(
+      new Error("Stripe API error")
+    );
+
+    const result = await getAuditSubscriptionInfo({
+      customerId: "cus_xyz",
+    });
+
+    expect(result).toBeNull();
+  });
+});
+
+describe("handleAuditAddonWebhook", () => {
+  const orgId = "org_456";
+
+  beforeEach(() => {
+    mockOrgUpdate.mockResolvedValue({ id: orgId });
+    mockHasOtherActiveAddonSubscription.mockResolvedValue(false);
+  });
+
+  it("checkout.session.completed enables auditsEnabled + auditsEnabledAt", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "checkout.session.completed",
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith({
+      where: { id: orgId },
+      data: expect.objectContaining({
+        auditsEnabled: true,
+        auditsEnabledAt: expect.any(Date),
+      }),
+      select: { id: true },
+    });
+  });
+
+  it("subscription.created enables audits + marks usedAuditTrial for trials", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.created",
+      subscription: {
+        trial_end: 1700000000,
+        trial_start: 1699000000,
+        metadata: {},
+      } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith({
+      where: { id: orgId },
+      data: expect.objectContaining({
+        auditsEnabled: true,
+        auditsEnabledAt: expect.any(Date),
+        usedAuditTrial: true,
+      }),
+      select: { id: true },
+    });
+  });
+
+  it("subscription.created skips usedAuditTrial for transferred subscriptions", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.created",
+      subscription: {
+        trial_end: 1700000000,
+        trial_start: 1699000000,
+        metadata: { transferred_from_subscription: "sub_old" },
+      } as any,
+      organizationId: orgId,
+    });
+
+    const updateData = mockOrgUpdate.mock.calls[0][0].data;
+    expect(updateData).not.toHaveProperty("usedAuditTrial");
+    expect(updateData.auditsEnabled).toBe(true);
+  });
+
+  it("subscription.updated (active) enables audits", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: { status: "active" } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith({
+      where: { id: orgId },
+      data: { auditsEnabled: true },
+      select: { id: true },
+    });
+  });
+
+  it("subscription.updated (canceled) disables audits", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: { status: "canceled" } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith({
+      where: { id: orgId },
+      data: { auditsEnabled: false },
+      select: { id: true },
+    });
+  });
+
+  it("subscription.paused disables audits", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.paused",
+      subscription: { status: "paused" } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith({
+      where: { id: orgId },
+      data: { auditsEnabled: false },
+      select: { id: true },
+    });
+  });
+
+  it("subscription.deleted disables audits", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.deleted",
+      subscription: { status: "canceled" } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith({
+      where: { id: orgId },
+      data: { auditsEnabled: false },
+      select: { id: true },
+    });
+  });
+
+  it("subscription.updated (past_due) leaves the add-on as it is", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: {
+        id: "sub_1",
+        customer: "cus_xyz",
+        status: "past_due",
+      } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("invoice.overdue switches the add-on off", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "invoice.overdue",
+      subscription: {
+        id: "sub_1",
+        customer: "cus_xyz",
+        status: "past_due",
+      } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).toHaveBeenCalledWith({
+      where: { id: orgId },
+      data: { auditsEnabled: false },
+      select: { id: true },
+    });
+  });
+
+  it("invoice.overdue keeps the add-on on while another live subscription carries it", async () => {
+    mockHasOtherActiveAddonSubscription.mockResolvedValue(true);
+
+    await handleAuditAddonWebhook({
+      eventType: "invoice.overdue",
+      subscription: {
+        id: "sub_1",
+        customer: "cus_xyz",
+        status: "past_due",
+      } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("unknown event makes no database call", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "some.unknown.event",
+      organizationId: orgId,
+    });
+
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("keeps audits on when another live subscription still carries the add-on for this workspace", async () => {
+    mockHasOtherActiveAddonSubscription.mockResolvedValue(true);
+
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.paused",
+      subscription: {
+        id: "sub_bundled",
+        customer: "cus_1",
+        status: "paused",
+      } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockHasOtherActiveAddonSubscription).toHaveBeenCalledWith({
+      customerId: "cus_1",
+      organizationId: orgId,
+      addonType: "audits",
+      exceptSubscriptionId: "sub_bundled",
+    });
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("keeps audits on through an inactive status change while another subscription covers it", async () => {
+    mockHasOtherActiveAddonSubscription.mockResolvedValue(true);
+
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: {
+        id: "sub_bundled",
+        customer: { id: "cus_1" },
+        status: "canceled",
+      } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockHasOtherActiveAddonSubscription).toHaveBeenCalledWith(
+      expect.objectContaining({ customerId: "cus_1" })
+    );
+    expect(mockOrgUpdate).not.toHaveBeenCalled();
+  });
+
+  it("does not consult other subscriptions when the status change keeps the add-on active", async () => {
+    await handleAuditAddonWebhook({
+      eventType: "customer.subscription.updated",
+      subscription: { id: "sub_1", customer: "cus_1", status: "active" } as any,
+      organizationId: orgId,
+    });
+
+    expect(mockHasOtherActiveAddonSubscription).not.toHaveBeenCalled();
+    expect(mockOrgUpdate).toHaveBeenCalledWith(
+      expect.objectContaining({ data: { auditsEnabled: true } })
+    );
+  });
+});
+
+describe("add-on price validation (entitlement bypass)", () => {
+  /**
+   * A TIER price is an ordinary active recurring price, so before this guard
+   * it was accepted here. The route enables the feature flag eagerly, and the
+   * resulting subscription carries a tierId — which makes `isAddonSubscription`
+   * return false, so the add-on webhook that would clear the flag never runs.
+   * Net effect: a one-time 7-day trial granted the paid feature permanently.
+   *
+   * detail.dev finding D094.
+   */
+  it("surfaces the price-validation message, not the generic wrapper text", async () => {
+    // The wrapping catch used to rewrite every failure to "Please try again
+    // later", handing back a 400 that asks the user to retry a request which
+    // can never succeed.
+    mockStripe.prices.retrieve.mockResolvedValue({
+      id: "price_tier",
+      active: true,
+      type: "recurring",
+      product: {
+        id: "prod_tier",
+        deleted: false,
+        active: true,
+        metadata: { shelf_tier: "tier_2" },
+      },
+    });
+
+    await expect(
+      createAuditAddonTrialSubscription({
+        customerId: "cus_123",
+        priceId: "price_tier",
+        userId: "user_1",
+        organizationId: "org_1",
+      })
+    ).rejects.toMatchObject({
+      status: 400,
+      message: "The selected plan is not available for this add-on.",
+    });
+  });
+
+  it("refuses a tier price and never creates a subscription", async () => {
+    mockStripe.prices.retrieve.mockResolvedValue({
+      id: "price_tier",
+      active: true,
+      type: "recurring",
+      product: {
+        id: "prod_tier",
+        deleted: false,
+        active: true,
+        metadata: { shelf_tier: "tier_2" },
+      },
+    });
+
+    await expect(
+      createAuditAddonTrialSubscription({
+        customerId: "cus_123",
+        priceId: "price_tier",
+        userId: "user_1",
+        organizationId: "org_1",
+      })
+    ).rejects.toBeInstanceOf(ShelfError);
+
+    expect(mockStripe.subscriptions.create).not.toHaveBeenCalled();
+  });
+
+  it("refuses a tier price on the checkout path too", async () => {
+    mockStripe.prices.retrieve.mockResolvedValue({
+      id: "price_tier",
+      active: true,
+      type: "recurring",
+      product: {
+        id: "prod_tier",
+        deleted: false,
+        active: true,
+        metadata: { shelf_tier: "tier_2" },
+      },
+    });
+
+    await expect(
+      createAuditAddonCheckoutSession({
+        priceId: "price_tier",
+        userId: "user_1",
+        domainUrl: "https://app.shelf.nu",
+        customerId: "cus_123",
+        organizationId: "org_1",
+      })
+    ).rejects.toBeInstanceOf(ShelfError);
+
+    expect(mockStripe.checkout.sessions.create).not.toHaveBeenCalled();
+  });
+});

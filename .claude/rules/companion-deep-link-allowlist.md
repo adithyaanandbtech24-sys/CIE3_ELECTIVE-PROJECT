@@ -1,0 +1,78 @@
+---
+description: Adding a Companion deep-linkable route (Universal Links / App Links) requires updating the allowlist in FOUR places that must stay in sync, plus the screen must exist. Never claim the whole domain, never hand a claimed path back to the OS via Linking.openURL, and every claimed prefix MUST be matched in resource-path.ts so the router keeps it off an unmatched route.
+paths:
+  - "apps/webapp/app/routes/*well-known*"
+  - "apps/companion/app.json"
+  - "apps/companion/lib/deep-links.ts"
+  - "apps/companion/lib/link-routing.ts"
+  - "apps/companion/app/**/*.tsx"
+  - "apps/companion/app/+native-intent.ts"
+  - "apps/companion/lib/resource-path.ts"
+  - "apps/companion/lib/open-link.ts"
+---
+
+# Companion Deep-Link Allowlist Consistency
+
+`https://app.shelf.nu/...` links open the Companion app (not the web) only for
+an explicit path allowlist. That allowlist is declared in **four places** and
+they MUST stay in sync. Touch one → check the other three.
+
+| #   | File                                                                  | What to add for a new route (e.g. `/locations`)                                        |
+| --- | --------------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| 1   | `apps/webapp/app/routes/[.well-known].apple-app-site-association.tsx` | a `{ "/": "/locations/*" }` entry in `DEEP_LINK_COMPONENTS` (iOS)                      |
+| 2   | `apps/companion/app.json` → `android.intentFilters[].data`            | `{ "scheme": "https", "host": "app.shelf.nu", "pathPrefix": "/locations/" }` (Android) |
+| 3   | `apps/companion/lib/resource-path.ts`                                 | `locations` in `matchResourcePath`, then a REAL route in `nativeRouteForLink`          |
+| 4   | `apps/companion/lib/deep-links.ts`                                    | nothing, unless the link needs an API call first (like `qr`): then a `ParsedLink` case |
+
+**The claimed host** (`app.shelf.nu`) is also written in
+`apps/companion/lib/open-link.ts` (`CLAIMED_WEB_HOST`), which sends a tapped
+link on a claimed host to the app screen its path names (through
+`matchResourcePath`) or else the in-app browser, never `Linking.openURL`.
+Change it with `app.json`.
+
+**Division of labour:** the JS hook (#4) opens every link that names a screen
+of the app, `https://` and `shelf://`, at launch and while the app runs, through
+`openLinkedRoute`, which roots the target tab at its list. The route comes from
+`nativeRouteForLink` (#3), so nested kit ids and the query survive, and `/qr/:id`
+resolves through the API first. expo-router opens none of them: `+native-intent.ts`
+returns the start screen for such a link at launch and `null` (open nothing)
+while the app runs (`systemPathFor`). A link the router opens itself lands with
+no list under it, so the detail has no back button and the tab is stuck. Links
+that name no screen (the sign-in callback) stay with the router. Change the
+split only in `apps/companion/lib/link-routing.ts`, with its tests.
+
+**Prerequisite:** the destination screen must already exist (e.g.
+`apps/companion/app/(tabs)/locations/[id].tsx`) and be reachable via
+`openLinkedRoute` / `pushIntoTab`: anchored navigation, or the back button strands the user
+(App Store Guideline 2.1).
+
+**Rollout:** #1 ships with a normal webapp deploy. #2–#4 live in the native
+binary → require a new app build + store submission (no OTA).
+
+## Three hard rules — getting these wrong is a production incident
+
+❌ **Never claim an HTTPS prefix without a `resource-path.ts` match (#3).** The
+OS delivers EVERY nested path under a claimed prefix (the canonical web asset
+URL is `/assets/:id/overview`). A prefix `matchResourcePath` does not know is
+handed to the router unchanged, which lands on an unmatched route at cold start
+and can leave the user on the splash screen. A matched prefix is kept from the
+router (`systemPathFor` returns the start screen at launch), and
+`nativeRouteForLink` maps deeper-nested paths to the resource DETAIL screen,
+which is what the tapper wants. `app/+not-found.tsx` redirects any remaining
+unmatched route to the start screen as a last-resort net.
+
+❌ **Never claim the whole domain / never add an auth path.** Do not use a `/*`
+wildcard and never list `/login`, `/oauth*`, `/sso-login`, `/forgot-password`,
+`/join`, `/accept-invite*`, `/otp`, `/send-otp`, `/resend-otp`, `/logout`. The
+OS would hijack those links into the app, which has no screen for them →
+breaks web login / password reset / invites for everyone with the app.
+
+❌ **Never `Linking.openURL` a claimed path.** A web-fallback to a claimed URL
+(e.g. `https://app.shelf.nu/qr/...`) is re-intercepted by Android App Links and
+re-opens the app → infinite loop. Use `openShelfWebUrl()` (`lib/navigation.ts`,
+in-app browser) instead. Every web page the app opens goes through it,
+tapped links included (`openLink` in `lib/link-actions.ts`).
+
+✅ Allowlist mirrors a real native screen, is path-scoped (trailing slash so
+index pages aren't claimed), is matched in `resource-path.ts` (#3),
+and web hand-offs go through `openShelfWebUrl`.

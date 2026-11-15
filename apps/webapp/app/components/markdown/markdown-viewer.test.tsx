@@ -1,0 +1,242 @@
+import { render, screen } from "@testing-library/react";
+import { MemoryRouter } from "react-router";
+
+import { DateS } from "~/components/shared/date";
+import type * as DateFormatModule from "~/utils/date-format";
+import { MarkdownViewer } from "./markdown-viewer";
+
+// why: the hook reads the user's prefs from the root route loader, which a
+// MemoryRouter does not have. Keep the real pure formatter rather than a stub:
+// it throws on an invalid date, so the unparseable-date test fails unless
+// DateS guards the value before formatting.
+vi.mock("~/hooks/use-date-formatter", async () => {
+  const { formatDate } = await vi.importActual<typeof DateFormatModule>(
+    "~/utils/date-format"
+  );
+  const prefs = {
+    dateFormat: "MM_DD_YYYY",
+    timeFormat: "H12",
+    weekStartsOn: 0,
+    timeZone: "UTC",
+  } as const;
+  return {
+    useDateFormatter: () => ({
+      prefs,
+      formatDate: (value: string | Date, opts?: object) =>
+        formatDate(value, prefs as never, opts),
+    }),
+  };
+});
+
+// why: internal links render through `Button`, which is a react-router `Link`.
+const renderNote = (content: string, allowExternalLinks = false) =>
+  render(
+    <MemoryRouter>
+      <MarkdownViewer
+        content={content}
+        allowExternalLinks={allowExternalLinks}
+      />
+    </MemoryRouter>
+  );
+
+describe("MarkdownViewer", () => {
+  describe("date tags", () => {
+    it("renders an unparseable date tag as its raw text instead of throwing", () => {
+      // A stored comment can carry any value in a `date` tag; formatting an
+      // invalid date throws, which would take down the page around the note.
+      const { getByText } = renderNote(
+        'Due {% date value="not-a-date" /%} please.'
+      );
+
+      expect(getByText("not-a-date")).toBeVisible();
+    });
+
+    it("still formats a valid date tag", () => {
+      const { queryByText, container } = renderNote(
+        '{% date value="2024-01-15T10:30:00.000Z" includeTime=false /%}'
+      );
+
+      expect(queryByText("2024-01-15T10:30:00.000Z")).toBeNull();
+      expect(container.textContent).toContain("01/15/2024");
+    });
+  });
+
+  describe("DateS values outside a note", () => {
+    it("formats a bare calendar date as that day", () => {
+      render(<DateS date="2024-02-29" />);
+
+      expect(screen.getByText("02/29/2024")).toBeVisible();
+    });
+
+    it("renders an invalid Date object as its text instead of throwing", () => {
+      render(<DateS date={new Date(Number.NaN)} />);
+
+      expect(screen.getByText("Invalid Date")).toBeVisible();
+    });
+  });
+
+  describe("free text without tags", () => {
+    it("drops Markdoc tags but keeps the text and markdown", () => {
+      const { container } = render(
+        <MemoryRouter>
+          <MarkdownViewer
+            content={
+              'Spare **battery** {% booking_status status="COMPLETE" /%} kept'
+            }
+            withTags={false}
+          />
+        </MemoryRouter>
+      );
+
+      expect(container.querySelector("strong")?.textContent).toBe("battery");
+      expect(container.textContent).toContain("Spare");
+      expect(container.textContent).toContain("kept");
+      expect(container.textContent).not.toMatch(/COMPLETE|booking_status/i);
+    });
+  });
+
+  describe("system note content (no external links)", () => {
+    // These strings are shaped like real system notes: our own wrapper output
+    // with a user-controlled entity name spliced into it. The name is the
+    // attacker's input.
+    it("renders an ordinary Markdown link as plain text", () => {
+      // The vector the custom-tag guard misses entirely: `[text](url)` needs no
+      // Markdoc delimiters, so write-time stripping never sees it.
+      const { container, getByText } = renderNote(
+        "changed booking name from **old** to **[Verify your account](https://evil.example/phish)**."
+      );
+
+      expect(getByText("Verify your account")).toBeVisible();
+      expect(container.querySelector("a")).toBeNull();
+      expect(container.innerHTML).not.toContain("evil.example");
+    });
+
+    it("drops an off-origin image but keeps its alt text", () => {
+      // An injected image fires an off-origin request the moment the feed
+      // loads — a tracking pixel aimed at whoever views the note.
+      const { container } = renderNote(
+        "updated the asset ![px](https://evil.example/track.png) today."
+      );
+
+      expect(container.querySelector("img")).toBeNull();
+      expect(container.innerHTML).not.toContain("evil.example");
+      expect(container.textContent).toContain("px");
+    });
+
+    it("still renders internal links", () => {
+      const { container } = renderNote("moved to [Shelf A](/locations/loc-1).");
+
+      expect(container.querySelector("a")).toHaveAttribute(
+        "href",
+        "/locations/loc-1"
+      );
+    });
+
+    it("neutralizes the custom link tag with an off-origin target", () => {
+      const { container, getByText } = renderNote(
+        '{% link to="https://evil.example" text="Verify" /%}'
+      );
+
+      expect(getByText("Verify")).toBeVisible();
+      expect(container.querySelector("a")).toBeNull();
+    });
+  });
+
+  describe("user-authored comments (external links allowed)", () => {
+    it("keeps an external link but adds the tabnabbing guard", () => {
+      const { container } = renderNote(
+        "see [the manual](https://supplier.example/manual.pdf)",
+        true
+      );
+
+      const link = container.querySelector("a");
+      expect(link).toHaveAttribute(
+        "href",
+        "https://supplier.example/manual.pdf"
+      );
+      expect(link).toHaveAttribute("rel", "noopener noreferrer");
+    });
+
+    it.each([
+      ["javascript", "javascript:alert(1)"],
+      ["data", "data:text/html,<script>alert(1)</script>"],
+      ["vbscript", "vbscript:msgbox(1)"],
+    ])("still blocks the %s scheme", (_label, payload) => {
+      // Allowing authors to link out must never extend to script-bearing
+      // schemes, comment or not.
+      const { container } = renderNote(`click [here](${payload})`, true);
+
+      expect(container.querySelector("a")).toBeNull();
+    });
+
+    it("still drops off-origin images", () => {
+      const { container } = renderNote(
+        "![px](https://evil.example/track.png)",
+        true
+      );
+
+      expect(container.querySelector("img")).toBeNull();
+    });
+  });
+
+  it("shows a Markdoc example in an author's code span exactly as typed", () => {
+    const { container } = renderNote(
+      'Use `{% link to="C:\\tmp" text="x" /%}` here.',
+      true
+    );
+
+    expect(container.querySelector("code")).toHaveTextContent(
+      '{% link to="C:\\tmp" text="x" /%}'
+    );
+  });
+
+  describe("link chips", () => {
+    const renderComment = (content: string, allowExternalLinks: boolean) =>
+      render(
+        <MemoryRouter>
+          <MarkdownViewer
+            content={content}
+            allowExternalLinks={allowExternalLinks}
+            linkChips
+          />
+        </MemoryRouter>
+      );
+
+    it("shows a bare URL in a comment as a chip that opens in a new tab", () => {
+      const { container } = renderComment(
+        "Manual: https://docs.example.com/manual.pdf (rev B)",
+        true
+      );
+
+      const chip = container.querySelector(
+        'a[href^="https://docs.example.com/manual.pdf"]'
+      );
+      expect(chip).not.toBeNull();
+      expect(chip).toHaveAttribute("target", "_blank");
+      expect(container.textContent).toContain("(rev B)");
+    });
+
+    it("makes no chip where external links are not allowed", () => {
+      const { container } = renderComment(
+        "renamed to **https://evil.example/login**",
+        false
+      );
+
+      expect(container.querySelector("a")).toBeNull();
+      expect(container.textContent).toContain("https://evil.example/login");
+    });
+
+    it("shows a bare URL as text without linkChips", () => {
+      const { container } = render(
+        <MemoryRouter>
+          <MarkdownViewer
+            content="Manual: https://docs.example.com/manual.pdf"
+            allowExternalLinks
+          />
+        </MemoryRouter>
+      );
+
+      expect(container.querySelector("a")).toBeNull();
+    });
+  });
+});

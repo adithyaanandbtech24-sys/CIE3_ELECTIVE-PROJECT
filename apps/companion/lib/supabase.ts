@@ -1,0 +1,245 @@
+/**
+ * Supabase client for the ACTIVE server.
+ *
+ * The app can be connected to Shelf Cloud or to a customer's self-hosted
+ * instance, each of which is a different Supabase project. The client is
+ * therefore rebuildable at runtime rather than a module singleton — consumers
+ * must call `getSupabase()` at use time and never capture the result in a
+ * module-scope binding, or they will keep talking to the previous server.
+ *
+ * Sessions persist through the session storage of `./session-storage.ts`
+ * rather than AsyncStorage, because a refresh token belongs in the keychain.
+ * SecureStore rejects values the platform considers oversized, and a Supabase
+ * session is long enough to be at risk, so values past 2000 characters are
+ * split across numbered chunk keys and reassembled on read.
+ *
+ * @see ./server/active-server.ts — owns when the rebuild happens
+ */
+import AsyncStorage from "@react-native-async-storage/async-storage";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
+import * as SecureStore from "expo-secure-store";
+import { Platform } from "react-native";
+import type { ServerConfig } from "./server/contract";
+import { sessionStorageKey } from "./session-storage-keys";
+import { createSessionBlock } from "./session-block";
+import {
+  createSessionStorage,
+  type SecureKeyValueStore,
+} from "./session-storage";
+
+/**
+ * Sessions a sign-out could not delete. Reads of their keys answer "nothing
+ * stored" and delete them (see `./session-block.ts`).
+ */
+const sessionBlock = createSessionBlock(AsyncStorage);
+
+/**
+ * The key-value store sessions live in: SecureStore on the phone (a refresh
+ * token belongs in the keychain), localStorage on web.
+ */
+const secureKeyValueStore: SecureKeyValueStore =
+  Platform.OS === "web"
+    ? {
+        getItemAsync: async (key) =>
+          typeof localStorage !== "undefined"
+            ? localStorage.getItem(key)
+            : null,
+        setItemAsync: async (key, value) => {
+          if (typeof localStorage !== "undefined") {
+            localStorage.setItem(key, value);
+          }
+        },
+        deleteItemAsync: async (key) => {
+          if (typeof localStorage !== "undefined") localStorage.removeItem(key);
+        },
+      }
+    : SecureStore;
+
+/**
+ * Session storage: the adapter supabase-js uses (values past 2000 characters
+ * are chunked, the most iOS SecureStore accepts per item), plus the verified
+ * delete and the sign-in preparation (see `./session-storage.ts`).
+ */
+const sessionStorage = createSessionStorage({
+  store: secureKeyValueStore,
+  block: sessionBlock,
+  chunkSize: Platform.OS === "web" ? Number.POSITIVE_INFINITY : 2000,
+  onError: (operation, key, error) => {
+    if (__DEV__)
+      console.error(`[SecureStore] ${operation}(${key}) failed:`, error);
+  },
+});
+
+const secureStoreAdapter = sessionStorage.adapter;
+
+/**
+ * The live client. Replaced wholesale on every server switch, which is why
+ * nothing outside this module may hold a reference to it.
+ */
+let client: SupabaseClient | null = null;
+
+/**
+ * URL the live client was built with. Tracked because `SupabaseClient` does not
+ * expose it, and `apiFetch` asserts against it that the session it is about to
+ * send belongs to the active server.
+ */
+let clientUrl: string | null = null;
+
+/**
+ * SecureStore key the live client keeps its session under. Set together with
+ * {@link clientUrl}.
+ */
+let clientStorageKey: string | null = null;
+
+/**
+ * Creates a client for one server, with the shared secure-storage adapter.
+ *
+ * @param supabaseUrl - The server's Supabase project URL.
+ * @param supabaseAnonKey - That project's public anon key.
+ * @returns A configured Supabase client.
+ */
+function createForServer(
+  supabaseUrl: string,
+  supabaseAnonKey: string
+): SupabaseClient {
+  const storageKey = sessionStorageKey(supabaseUrl);
+  const created = createClient(supabaseUrl, supabaseAnonKey, {
+    auth: {
+      storage: secureStoreAdapter,
+      storageKey,
+      autoRefreshToken: true,
+      persistSession: true,
+      detectSessionInUrl: false,
+    },
+  });
+
+  // Recorded only once construction has succeeded. `createClient` validates the
+  // URL and throws on a malformed one; setting this first would leave
+  // `clientUrl` naming a server the live client is not connected to, and
+  // `guardSessionServerMatch` — which compares exactly these two values — would
+  // then agree with itself and wave the previous server's token through.
+  clientUrl = supabaseUrl;
+  clientStorageKey = storageKey;
+  return created;
+}
+
+/**
+ * Returns the Supabase client for the active server, creating it on first use
+ * from the bundled Shelf Cloud credentials.
+ *
+ * Supabase namespaces its own session storage as `sb-<project-ref>-auth-token`,
+ * derived from the URL, so sessions for two different servers cannot collide in
+ * SecureStore.
+ *
+ * @returns The live client.
+ */
+export function getSupabase(): SupabaseClient {
+  if (!client) {
+    // why: the cloud credentials are read from process.env here AND in
+    // `CLOUD_SERVER` (server/active-server.ts). That duplication is deliberate
+    // — importing CLOUD_SERVER would make this module depend on
+    // active-server.ts, which already depends on this one. Do not "fix" it.
+    client = createForServer(
+      process.env.EXPO_PUBLIC_SUPABASE_URL!,
+      process.env.EXPO_PUBLIC_SUPABASE_ANON_PUBLIC!
+    );
+  }
+  return client;
+}
+
+/**
+ * Returns a function that deletes the CURRENT client's stored session straight
+ * from SecureStore.
+ *
+ * The key is captured now, so a teardown that finishes after a server switch
+ * removes only the outgoing client's session, never the new server's. Used as
+ * the last step of `endSessionOnDevice` (`./server/end-session.ts`), for when
+ * supabase-js could not sign out even locally. It emits no auth event, so the
+ * caller updates its own signed-in state.
+ *
+ * @returns The remover. It resolves once the session and its companion keys
+ *   are verifiably gone, and rejects when that cannot be verified (a failed
+ *   delete or read-back), so the teardown never mistakes a failure for a
+ *   removed session.
+ */
+export function persistedSessionRemover(): () => Promise<void> {
+  const storageKey = clientStorageKey;
+  return async () => {
+    if (storageKey) await sessionStorage.removeSession(storageKey);
+  };
+}
+
+/**
+ * The session storage key of the live client, or null before one exists.
+ *
+ * @returns The key
+ */
+export function currentSessionStorageKey(): string | null {
+  return clientStorageKey;
+}
+
+/**
+ * Refuses a stored session from now on, across restarts, after a sign-out
+ * that could not delete it. Every later read of it answers "nothing stored"
+ * and retries the delete.
+ *
+ * @param storageKey - The signed-out client's session storage key
+ * @returns True when the block is stored, so it survives a restart
+ */
+export async function blockStoredSession(storageKey: string): Promise<boolean> {
+  return sessionBlock.block(storageKey);
+}
+
+/**
+ * Prepares the live client's session key for a sign-in. When a past sign-out
+ * blocked that key, the old session is removed and the block is lifted only
+ * once the removal is verified, so the previous person's session is never
+ * readable while the sign-in runs. Never rejects; on failure the block stays.
+ *
+ * @returns False when the key is still blocked: the sign-in must not run
+ */
+export async function prepareStoredSessionForSignIn(): Promise<boolean> {
+  if (!clientStorageKey) return true;
+  return sessionStorage.prepareSignIn(clientStorageKey);
+}
+
+/**
+ * The URL the live Supabase client was built with.
+ *
+ * @returns The URL, or `null` when no client has been created yet.
+ * @see ./server/contract.ts — `isSessionServerMismatched`, which consumes this
+ */
+export function getSupabaseClientUrl(): string | null {
+  return clientUrl;
+}
+
+/**
+ * Replaces the live client with one pointed at `config`'s Supabase project, and
+ * stops the outgoing client's token auto-refresh.
+ *
+ * Callers are responsible for signing out of the previous client BEFORE calling
+ * this, and for rearming anything subscribed to the old client's auth events —
+ * see `setActiveServer`.
+ *
+ * @param config - The server being switched to.
+ * @returns The newly created client.
+ */
+export function rebuildSupabase(config: ServerConfig): SupabaseClient {
+  const previous = client;
+  // A throw from `createForServer` leaves BOTH `client` and `clientUrl` on the
+  // previous server, which is the safe pairing: the two still agree, so the
+  // request chokepoint keeps working rather than silently matching a client
+  // that was never built.
+  client = createForServer(config.supabaseUrl, config.supabaseAnonKey);
+
+  // why: with `autoRefreshToken: true` and no `document` (React Native),
+  // GoTrueClient unconditionally starts a setInterval ticker that ONLY
+  // stopAutoRefresh() clears. Dropping the reference alone strands it for the
+  // process lifetime, still refreshing the previous server's session every 30s.
+  // Fire-and-forget: clearInterval happens synchronously inside, and a
+  // rejection must never block the switch. (`dispose()` does not exist in the
+  // pinned auth-js version.)
+  void previous?.auth.stopAutoRefresh().catch(() => {});
+
+  return client;
+}

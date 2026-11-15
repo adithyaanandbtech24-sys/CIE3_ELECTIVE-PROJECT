@@ -1,0 +1,79 @@
+/**
+ * SSE stream of toast notifications for the logged-in user.
+ *
+ * Payloads are read from this machine's local emitter, which the notification
+ * bus feeds with toasts published by ANY machine, so the action that sent a
+ * toast need not have run here.
+ *
+ * @see {@link file://./../../utils/emitter/notification-bus.server.ts}
+ */
+import type { LoaderFunctionArgs } from "react-router";
+import { eventStream } from "remix-utils/sse/server";
+import { emitter } from "~/utils/emitter/emitter.server";
+import { ShelfError } from "~/utils/error";
+import { Logger } from "~/utils/logger";
+
+export function loader({ context, request }: LoaderFunctionArgs) {
+  const authSession = context.getSession();
+  const url = new URL(request.url);
+  const connectionTabId = url.searchParams.get("tabId");
+
+  return eventStream(request.signal, function setup(send) {
+    /** Notification is a stringified json object with the shape {@link Notification} */
+    function handle(notification: string) {
+      // Payloads arrive from Postgres, where anyone with database access can
+      // NOTIFY the channel, so anything that is not a toast object is ignored
+      let parsed: { senderId?: unknown; tabId?: unknown } | null;
+      try {
+        parsed = JSON.parse(notification);
+      } catch {
+        return;
+      }
+      if (!parsed || typeof parsed !== "object") {
+        return;
+      }
+
+      /** We only send the notification if the logged in userId is the same as the senderId.
+       * We do this to prevent other users receiving notifications
+       */
+      if (authSession.userId !== parsed.senderId) {
+        return;
+      }
+
+      // Only deliver tab-scoped notifications to the originating tab
+      if (parsed.tabId && connectionTabId && parsed.tabId !== connectionTabId) {
+        return;
+      }
+
+      try {
+        send({ event: "new-notification", data: notification });
+      } catch (cause) {
+        /**
+         * node:92658) UnsupportedWarning: The provided connection header is not valid, the value will be dropped from the header and will never be in use.
+         * This is 'expected'
+         * sse wants 0 headers lol (they are removed in Remix Express). Can't do that for Hono since reading response consume the ReadableStream :/
+         */
+        if (
+          cause instanceof Error &&
+          cause.message.match(/Controller is already closed/)
+        ) {
+          return;
+        }
+
+        Logger.error(
+          new ShelfError({
+            cause,
+            message: "Failed to send SSE notification",
+            additionalData: { userId: authSession.userId },
+            label: "Notification",
+          })
+        );
+      }
+    }
+    emitter.on("notification", handle);
+
+    return function clear() {
+      emitter.off("notification", handle);
+    };
+  });
+}

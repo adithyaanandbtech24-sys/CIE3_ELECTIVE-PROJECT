@@ -1,0 +1,1183 @@
+import { Readable } from "node:stream";
+
+import { parseFormData } from "@remix-run/form-data-parser";
+import type { FileUpload } from "@remix-run/form-data-parser";
+import type { LRUCache } from "lru-cache";
+import type { ResizeOptions } from "sharp";
+
+import { getSupabaseAdmin } from "~/integrations/supabase/client";
+import {
+  ASSET_MAX_IMAGE_UPLOAD_SIZE,
+  DEFAULT_MAX_IMAGE_UPLOAD_SIZE,
+  PUBLIC_BUCKET,
+} from "./constants";
+import { createFileFromAsyncIterable } from "./create-buffer-from-async-iterable";
+import { cropImage } from "./crop-image";
+import { delay } from "./delay";
+import { SUPABASE_URL } from "./env";
+import type { AdditionalData, ErrorLabel } from "./error";
+import { isLikeShelfError, ShelfError } from "./error";
+import { extractImageNameFromSupabaseUrl } from "./extract-image-name-from-supabase-url";
+import { getMaxFileSizeExceededError } from "./form-data-parse-errors.server";
+import { id } from "./id/id.server";
+import { detectImageFormat } from "./image-format.server";
+import {
+  cacheOptimizedImage,
+  type CachedImage,
+} from "./import.image-cache.server";
+import { Logger } from "./logger";
+import { BlockedAddressError, safeFetch } from "./ssrf.server";
+import type { SafeFetchResult } from "./ssrf.server";
+
+const label: ErrorLabel = "File storage";
+
+export function getPublicFileURL({
+  filename,
+  bucketName = "profile-pictures",
+}: {
+  filename: string;
+  bucketName?: string;
+}) {
+  try {
+    const { data } = getSupabaseAdmin()
+      .storage.from(bucketName)
+      .getPublicUrl(filename);
+
+    return data.publicUrl;
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to get public file URL",
+      additionalData: { filename, bucketName },
+      label,
+    });
+  }
+}
+
+export async function createSignedUrl({
+  filename,
+  bucketName = "assets",
+}: {
+  filename: string;
+  bucketName?: string;
+}): Promise<string> {
+  const normalizedFilename = filename.startsWith("/")
+    ? filename.substring(1)
+    : filename;
+  const maxAttempts = 3;
+
+  try {
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      const { data, error } = await getSupabaseAdmin()
+        .storage.from(bucketName)
+        .createSignedUrl(normalizedFilename, 3 * 24 * 60 * 60); // 72h — must match threeDaysFromNow() in refreshExpiredAssetImages
+
+      if (!error) {
+        const signedUrl = data?.signedUrl;
+        if (!signedUrl) {
+          throw new ShelfError({
+            cause: null,
+            message: "Supabase did not return a signed URL",
+            additionalData: { filename: normalizedFilename, bucketName },
+            label,
+          });
+        }
+        return signedUrl;
+      }
+
+      // Supabase occasionally responds with HTML on 50x/edge errors, which the client surfaces
+      // as StorageUnknownError with a JSON parse failure. Retry before surfacing it to keep
+      // transient CDN hiccups from bubbling up as user-facing ShelfErrors.
+      const isHtmlError = isSupabaseHtmlError(error);
+      const isFetchFailed = isSupabaseFetchFailedError(error);
+
+      if (isHtmlError || isFetchFailed) {
+        if (attempt < maxAttempts) {
+          Logger.warn(
+            new ShelfError({
+              cause: error,
+              message: isHtmlError
+                ? "Supabase returned a non-JSON response while creating a signed URL. Retrying."
+                : "Supabase request failed while creating a signed URL. Retrying.",
+              additionalData: {
+                filename: normalizedFilename,
+                bucketName,
+                attempt,
+              },
+              label,
+              shouldBeCaptured: false,
+            })
+          );
+          await delay(1000);
+          continue;
+        }
+
+        // All retry attempts exhausted with HTML errors - this is a transient
+        // infrastructure issue that shouldn't spam Sentry
+        throw new ShelfError({
+          cause: error,
+          message:
+            "Supabase is experiencing temporary issues. Using existing URL.",
+          additionalData: {
+            filename: normalizedFilename,
+            bucketName,
+            attempts: maxAttempts,
+            errorType: isHtmlError
+              ? "persistent_html_error"
+              : "persistent_fetch_failed",
+          },
+          label,
+          shouldBeCaptured: false,
+        });
+      }
+
+      // Supabase returns 429 when the storage API is overwhelmed.
+      // Use exponential backoff to give the API time to recover.
+      if (isSupabaseRateLimitError(error)) {
+        if (attempt < maxAttempts) {
+          const backoffMs = Math.pow(2, attempt - 1) * 1000; // 1s, 2s
+          Logger.warn(
+            new ShelfError({
+              cause: error,
+              message:
+                "Supabase rate limit hit while creating a signed URL. Retrying with backoff.",
+              additionalData: {
+                filename: normalizedFilename,
+                bucketName,
+                attempt,
+                backoffMs,
+              },
+              label,
+              shouldBeCaptured: false,
+            })
+          );
+          await delay(backoffMs);
+          continue;
+        }
+
+        // All retries exhausted - this is a transient rate-limit issue
+        // that shouldn't spam Sentry
+        throw new ShelfError({
+          cause: error,
+          message:
+            "Supabase rate limit exceeded. Please try again in a moment.",
+          additionalData: {
+            filename: normalizedFilename,
+            bucketName,
+            attempts: maxAttempts,
+            errorType: "rate_limit_exceeded",
+          },
+          label,
+          shouldBeCaptured: false,
+        });
+      }
+
+      // Supabase returns 5xx (502, 503, 504) on transient infrastructure issues
+      // like gateway timeouts. Use exponential backoff before surfacing.
+      if (isSupabaseServerError(error)) {
+        if (attempt < maxAttempts) {
+          const backoffMs = Math.pow(2, attempt - 1) * 1000; // 1s, 2s
+          Logger.warn(
+            new ShelfError({
+              cause: error,
+              message:
+                "Supabase server error while creating a signed URL. Retrying with backoff.",
+              additionalData: {
+                filename: normalizedFilename,
+                bucketName,
+                attempt,
+                backoffMs,
+              },
+              label,
+              shouldBeCaptured: false,
+            })
+          );
+          await delay(backoffMs);
+          continue;
+        }
+
+        // All retries exhausted - this is a transient server issue
+        // that shouldn't spam Sentry
+        throw new ShelfError({
+          cause: error,
+          message:
+            "Supabase is experiencing temporary issues. Using existing URL.",
+          additionalData: {
+            filename: normalizedFilename,
+            bucketName,
+            attempts: maxAttempts,
+            errorType: "server_error",
+          },
+          label,
+          shouldBeCaptured: false,
+        });
+      }
+
+      throw error;
+    }
+
+    // The loop should always return or throw, but ensure we never fall through.
+    throw new ShelfError({
+      cause: null,
+      message: "Unable to create signed URL after retries.",
+      additionalData: { filename: normalizedFilename, bucketName },
+      label,
+    });
+  } catch (cause) {
+    // If it's already a ShelfError, preserve it (including shouldBeCaptured flag)
+    if (isLikeShelfError(cause)) {
+      throw cause;
+    }
+
+    throw new ShelfError({
+      cause,
+      message:
+        "Something went wrong while creating a signed URL. Please try again. If the issue persists contact support.",
+      additionalData: {
+        filename: normalizedFilename,
+        bucketName,
+        errorName:
+          typeof cause === "object" &&
+          cause !== null &&
+          "name" in cause &&
+          typeof (cause as { name?: unknown }).name === "string"
+            ? (cause as { name: string }).name
+            : undefined,
+        errorMessage:
+          typeof cause === "object" &&
+          cause !== null &&
+          "message" in cause &&
+          typeof (cause as { message?: unknown }).message === "string"
+            ? (cause as { message: string }).message
+            : undefined,
+      },
+      label,
+    });
+  }
+}
+
+/**
+ * Derives the storage path of an image's 108px thumbnail from the path of the
+ * full-size image: `-thumbnail` goes before the extension, or is appended when
+ * the path has none.
+ *
+ * Single source of truth for the convention, shared by the upload path (which
+ * creates the object) and the lazy `api+/asset.generate-thumbnail` route (which
+ * recreates it on demand) — the two must agree or a thumbnail is uploaded to
+ * one path and read from another.
+ *
+ * @param filename - Storage path of the full-size image (no bucket prefix)
+ * @returns Storage path its thumbnail lives at
+ */
+export function getThumbnailStoragePath(filename: string): string {
+  return filename.includes(".")
+    ? filename.replace(/(\.[^.]+)$/, "-thumbnail$1")
+    : `${filename}-thumbnail`;
+}
+
+export async function uploadFile(
+  fileData: AsyncIterable<Uint8Array>,
+  {
+    filename,
+    contentType,
+    bucketName,
+    resizeOptions,
+    generateThumbnail = false,
+    thumbnailSize = 108, // Default thumbnail size
+    upsert = false,
+    inspectOriginal,
+  }: UploadOptions & {
+    generateThumbnail?: boolean;
+    thumbnailSize?: number;
+    upsert?: boolean;
+    inspectOriginal?: InspectOriginal;
+  }
+): Promise<string | { originalPath: string; thumbnailPath: string }> {
+  try {
+    // Process original image
+    const file = await cropImage(
+      inspectOriginal
+        ? await withOriginalInspected(fileData, inspectOriginal)
+        : fileData,
+      resizeOptions
+    );
+
+    // Upload original file
+    const { data, error } = await getSupabaseAdmin()
+      .storage.from(bucketName)
+      .upload(filename, file, { contentType, upsert });
+
+    if (error) {
+      throw error;
+    }
+
+    // If thumbnail generation is requested
+    if (generateThumbnail) {
+      const thumbFilename = getThumbnailStoragePath(filename);
+
+      // Create thumbnail version with Sharp
+      const thumbnailFile = await cropImage(file, {
+        width: thumbnailSize,
+        height: thumbnailSize,
+        fit: "cover",
+        withoutEnlargement: true,
+      });
+
+      // Upload thumbnail
+      const { data: thumbData, error: thumbError } = await getSupabaseAdmin()
+        .storage.from(bucketName)
+        .upload(thumbFilename, thumbnailFile, { contentType, upsert: true });
+
+      if (thumbError) {
+        throw thumbError;
+      }
+
+      return {
+        originalPath: data.path,
+        thumbnailPath: thumbData.path,
+      };
+    }
+
+    // Return just the path string for backward compatibility
+    return data.path;
+  } catch (cause) {
+    const isShelfError = isLikeShelfError(cause);
+
+    throw new ShelfError({
+      cause,
+      message: isShelfError
+        ? cause.message
+        : "Something went wrong while uploading the file. Please try again or contact support.",
+      additionalData: { filename, contentType, bucketName },
+      label,
+      shouldBeCaptured: isShelfError ? cause.shouldBeCaptured : undefined,
+    });
+  }
+}
+
+/**
+ * Reads the uploaded file exactly as it arrived, before `cropImage` rotates,
+ * resizes and re-encodes it (which drops metadata such as EXIF).
+ */
+export type InspectOriginal = (original: Buffer) => Promise<void> | void;
+
+/**
+ * {@link InspectOriginal} for a multipart upload: also told which form field
+ * the file came in, so a caller can read only the part it stores.
+ */
+export type InspectUploadedOriginal = (
+  original: Buffer,
+  upload: { fieldName: string | undefined }
+) => Promise<void> | void;
+
+/**
+ * Buffers an upload, hands the bytes to `inspect`, and returns the same
+ * buffer for `cropImage`, so the upload is held in memory once.
+ *
+ * @param fileData - The upload as it streams in
+ * @param inspect - Reads the original bytes; a failure here is the caller's to
+ *   handle and never stops the upload
+ * @returns The bytes as uploaded
+ */
+async function withOriginalInspected(
+  fileData: AsyncIterable<Uint8Array>,
+  inspect: InspectOriginal
+): Promise<Buffer> {
+  const original = await createFileFromAsyncIterable(fileData);
+
+  // why: only a format `cropImage` accepts reaches an inspector. The upload
+  // handler admits any image/* type, and the image libraries behind an
+  // inspector must not parse bytes the upload is about to refuse.
+  if (detectImageFormat(original)) {
+    try {
+      await inspect(original);
+    } catch (cause) {
+      Logger.warn({ message: "Could not inspect an uploaded file", cause });
+    }
+  }
+
+  return original;
+}
+
+export interface UploadOptions {
+  bucketName: string;
+  filename: string;
+  contentType: string;
+  resizeOptions?: ResizeOptions;
+  upsert?: boolean;
+}
+
+/**
+ * The extension to give a stored upload, taken from the client's filename.
+ *
+ * Only 1 to 5 letters or digits are kept: the filename is client-chosen, and
+ * anything else (`/`, `%2e%2e`) would become part of the storage path.
+ *
+ * @param originalName - The filename the client sent, if any
+ * @returns The lower-cased extension, or `undefined` when there is no safe one
+ */
+export function safeUploadExtension(
+  originalName: string | undefined
+): string | undefined {
+  if (!originalName?.includes(".")) return undefined;
+  const extension = originalName.split(".").pop() ?? "";
+  return /^[a-z0-9]{1,5}$/i.test(extension)
+    ? extension.toLowerCase()
+    : undefined;
+}
+
+/**
+ * Uploads every image file part of a multipart request to storage and returns
+ * the stored paths, keyed by the form field each file came in on.
+ *
+ * The result holds the values this function's own upload handler produced,
+ * plus only the text parts the caller names in `textFields`. Callers sign and
+ * save the upload fields with the service-role client, so a plain text part
+ * named like a file field (`mainImage=<some path>`) must never come back: it
+ * would let a member point the signer at any object in the bucket, including
+ * another workspace's. Never list a file field in `textFields`.
+ *
+ * The stored file's extension is taken from the uploaded filename only when it
+ * is 1 to 5 letters or digits. Anything else (a `/`, a `%`) would put a client-
+ * chosen segment into the storage path, so it is dropped.
+ *
+ * @param args.request - The multipart request carrying the file parts
+ * @param args.newFileName - Storage path (without extension) for the upload
+ * @param args.textFields - Text parts to return alongside the uploads, read
+ *   from the same size-limited parse (never a second, unbounded one)
+ * @returns A FormData of `fieldName -> uploaded path` (or a JSON string of
+ *   `{ originalPath, thumbnailPath }` when `generateThumbnail` is set), plus
+ *   the named text fields
+ * @throws {ShelfError} 400 when a file exceeds `maxFileSize`
+ */
+export async function parseFileFormData({
+  request,
+  newFileName,
+  bucketName = "profile-pictures",
+  resizeOptions,
+  generateThumbnail = false,
+  thumbnailSize = 108,
+  maxFileSize = DEFAULT_MAX_IMAGE_UPLOAD_SIZE,
+  inspectOriginal,
+  textFields = [],
+}: {
+  request: Request;
+  newFileName: string;
+  bucketName?: string;
+  resizeOptions?: ResizeOptions;
+  generateThumbnail?: boolean;
+  thumbnailSize?: number;
+  maxFileSize?: number;
+  /** Reads each image file as uploaded, before it is resized and re-encoded */
+  inspectOriginal?: InspectUploadedOriginal;
+  /** Text parts to return with the uploads. Never a file field name. */
+  textFields?: readonly string[];
+}) {
+  try {
+    /** The values this function uploaded, the only thing it returns. */
+    const uploaded = new FormData();
+
+    const uploadAndStore = async (upload: any) => {
+      const file = upload?.file ?? upload;
+      const mimeType =
+        upload?.type ?? upload?.contentType ?? file?.type ?? undefined;
+      const originalName =
+        upload?.name ?? upload?.filename ?? file?.name ?? undefined;
+
+      // Only process image files. Matched as a prefix rather than a substring:
+      // `.includes("image")` also accepts a parameterised type such as
+      // `text/html; x=image`, which would then be handed to `uploadFile` as the
+      // content type the object is stored and served with.
+      if (mimeType && !String(mimeType).startsWith("image/")) {
+        return undefined;
+      }
+
+      if (!file) {
+        return undefined;
+      }
+
+      const fileStream = await normalizeToAsyncIterable(file);
+
+      if (!fileStream) {
+        return undefined;
+      }
+
+      // Only a short alphanumeric extension reaches the storage path; the
+      // filename is client-chosen and could otherwise carry `/` or `%2e%2e`.
+      const extension = safeUploadExtension(originalName);
+      const targetFilename = extension
+        ? `${newFileName}.${extension}`
+        : newFileName;
+
+      const uploadedFilePaths = await uploadFile(fileStream, {
+        filename: targetFilename,
+        contentType: mimeType ?? "application/octet-stream",
+        bucketName,
+        resizeOptions,
+        generateThumbnail,
+        thumbnailSize,
+        inspectOriginal: inspectOriginal
+          ? (original) =>
+              inspectOriginal(original, { fieldName: upload?.fieldName })
+          : undefined,
+      });
+
+      // For profile pictures and other cases that don't need thumbnails,
+      // the uploadFile function returns a string path
+      if (typeof uploadedFilePaths === "string") {
+        return uploadedFilePaths;
+      }
+
+      // For cases where thumbnails are generated, we need to store the object
+      // in a way that FormData can handle. We'll store it as a stringified JSON
+      if (generateThumbnail) {
+        return JSON.stringify(uploadedFilePaths);
+      }
+
+      // This shouldn't happen, but if it does, return the originalPath
+      return (uploadedFilePaths as { originalPath: string }).originalPath;
+    };
+
+    const uploadHandler = async (upload: FileUpload) => {
+      // A file sent under a text field's name is neither uploaded nor
+      // returned: the field must only ever carry the text the client typed.
+      if (textFields.includes(upload.fieldName)) return undefined;
+      const value = await uploadAndStore(upload);
+      if (value != null && upload.fieldName) {
+        uploaded.append(upload.fieldName, value);
+      }
+      return value;
+    };
+
+    // The parser also returns every text part verbatim. Only the named ones
+    // are copied over; the rest are dropped by returning `uploaded`.
+    const parsed = await parseFormData(request, { maxFileSize }, uploadHandler);
+    for (const field of textFields) {
+      for (const value of parsed.getAll(field)) {
+        if (typeof value === "string") uploaded.append(field, value);
+      }
+    }
+
+    return uploaded;
+  } catch (cause) {
+    const sizeLimitError = getMaxFileSizeExceededError(cause);
+
+    if (sizeLimitError) {
+      throw new ShelfError({
+        cause,
+        title: "File too large",
+        message: `Image file size exceeds maximum allowed size of ${
+          maxFileSize / (1024 * 1024)
+        }MB`,
+        additionalData: { maxFileSize },
+        label,
+        status: 400,
+        shouldBeCaptured: false,
+      });
+    }
+
+    const nestedShelfError = findShelfErrorInCause(cause);
+
+    throw new ShelfError({
+      cause,
+      message: nestedShelfError
+        ? nestedShelfError.message
+        : "Something went wrong while uploading the file. Please try again or contact support.",
+      title: nestedShelfError?.title,
+      label,
+      // The parser wraps the upload's error; its status (a 400 for a file
+      // the user can fix) must survive the wrapping like its message does.
+      status: nestedShelfError?.status,
+      shouldBeCaptured: nestedShelfError?.shouldBeCaptured,
+    });
+  }
+}
+
+/**
+ * Recursively walks the `.cause` chain to find a `ShelfError`.
+ *
+ * Libraries like `@remix-run/form-data-parser` wrap errors in their own
+ * `FormDataParseError`, hiding the nested ShelfError. This helper lets
+ * callers recover the original message, `title`, and `shouldBeCaptured` flag.
+ */
+export function findShelfErrorInCause(error: unknown): ShelfError | null {
+  if (isLikeShelfError(error)) {
+    return error;
+  }
+
+  const cause = (error as { cause?: unknown })?.cause;
+
+  if (!cause) {
+    return null;
+  }
+
+  return findShelfErrorInCause(cause);
+}
+
+/**
+ * Logs an error that occurred during image upload to Supoabase
+ * @param cause
+ * @param additionalData
+ */
+function logUploadError(cause: unknown, additionalData: AdditionalData) {
+  Logger.error(
+    new ShelfError({
+      cause,
+      message: "Failed to upload image",
+      additionalData,
+      label,
+    })
+  );
+}
+
+/**
+ * Normalise the various shapes `parseFormData` can hand us for file payloads
+ * (Blob, File, Buffer, Node streams, async iterables) into an AsyncIterable
+ * that Sharp can consume without crashing.
+ */
+async function normalizeToAsyncIterable(
+  file:
+    | AsyncIterable<Uint8Array>
+    | Readable
+    | Buffer
+    | Blob
+    | { stream?: () => any; arrayBuffer?: () => Promise<ArrayBuffer> }
+    | null
+    | undefined
+): Promise<AsyncIterable<Uint8Array> | null> {
+  if (!file) {
+    return null;
+  }
+
+  if (typeof (file as any)[Symbol.asyncIterator] === "function") {
+    return file as AsyncIterable<Uint8Array>;
+  }
+
+  if (file instanceof Readable) {
+    return file as AsyncIterable<Uint8Array>;
+  }
+
+  if (Buffer.isBuffer(file)) {
+    return (async function* bufferToIterable() {
+      await Promise.resolve();
+      yield file;
+    })();
+  }
+
+  // Remix now uses the undici File polyfill which exposes stream()/arrayBuffer()
+  if (typeof (file as Blob).stream === "function") {
+    const webStream = (file as Blob).stream();
+    if (typeof Readable.fromWeb === "function") {
+      return Readable.fromWeb(
+        webStream as any
+      ) as unknown as AsyncIterable<Uint8Array>;
+    }
+  }
+
+  if (typeof (file as Blob).arrayBuffer === "function") {
+    const buffer = Buffer.from(await (file as Blob).arrayBuffer());
+    return (async function* bufferToIterable() {
+      await Promise.resolve();
+      yield buffer;
+    })();
+  }
+
+  return null;
+}
+
+/**
+ * Downloads and processes an image from a URL for upload
+ * Implements caching of Supabase-optimized versions for repeated URLs
+ */
+export async function uploadImageFromUrl(
+  imageUrl: string,
+  { filename, contentType, bucketName, resizeOptions }: UploadOptions,
+  cache?: LRUCache<string, CachedImage>
+): Promise<string | null> {
+  try {
+    let buffer: Buffer;
+    let actualContentType: string;
+
+    // Check cache first if provided
+    if (cache) {
+      const cached = cache.get(imageUrl);
+      if (cached) {
+        buffer = cached.buffer;
+        actualContentType = cached.contentType;
+
+        // Upload cached optimized version
+        const { data, error } = await getSupabaseAdmin()
+          .storage.from(bucketName)
+          .upload(filename, buffer, {
+            contentType: actualContentType,
+            upsert: true,
+            metadata: {
+              source: "url",
+              originalUrl: imageUrl,
+            },
+          });
+
+        if (error) {
+          /** Log the error so we are aware if there are some issues with uploading */
+          logUploadError(error, {
+            imageUrl,
+            filename,
+            contentType,
+            bucketName,
+          });
+
+          throw error;
+        }
+        return data.path;
+      }
+    }
+
+    // If not in cache, download the image with retry logic.
+    // `safeFetch` enforces SSRF protection (blocks private/reserved/metadata
+    // addresses on every redirect hop) and a streaming size cap, so the raw
+    // destination URL can come straight from untrusted CSV input. See
+    // GHSA-xgrm-8w6v-mvjg and `./ssrf.server.ts`.
+    let fetchResult: SafeFetchResult | null = null;
+
+    // Try to fetch the image up to 2 times
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      try {
+        fetchResult = await safeFetch(imageUrl, {
+          maxBytes: ASSET_MAX_IMAGE_UPLOAD_SIZE,
+        });
+        break; // Success, exit retry loop
+      } catch (cause) {
+        // A blocked address is deterministic — retrying would just be blocked
+        // again, so bail out immediately rather than waiting and re-fetching.
+        const isBlocked = cause instanceof BlockedAddressError;
+
+        if (isBlocked || attempt === 2) {
+          Logger.error(
+            new ShelfError({
+              cause,
+              message: isBlocked
+                ? "Refused to fetch image from a private or reserved address"
+                : "Failed to fetch image from URL after 2 attempts",
+              additionalData: { imageUrl, attempts: attempt },
+              label,
+              shouldBeCaptured: false,
+            })
+          );
+          return null;
+        }
+        // Wait a moment before retrying
+        await delay(1000);
+      }
+    }
+
+    // This should not happen due to the early returns above, but TypeScript needs the check
+    if (!fetchResult) {
+      Logger.error(
+        new ShelfError({
+          cause: null,
+          message: "Unexpected null response after retry loop",
+          additionalData: { imageUrl },
+          label,
+          shouldBeCaptured: false,
+        })
+      );
+      return null;
+    }
+
+    actualContentType = fetchResult.contentType || contentType;
+
+    // The body was already read (and size-capped) by `safeFetch`.
+    buffer = fetchResult.buffer;
+
+    // For URLs that don't return proper image content-type headers (like Sortly),
+    // detect the image format from the actual file content using magic bytes
+    const detectedImageType = detectImageFormat(buffer);
+
+    if (!actualContentType?.startsWith("image/") && !detectedImageType) {
+      throw new ShelfError({
+        cause: null,
+        message: "URL does not point to a valid image",
+        additionalData: { imageUrl, contentType: actualContentType },
+        label,
+        shouldBeCaptured: false,
+      });
+    }
+
+    // Use detected format if HTTP header doesn't provide proper image content-type
+    if (detectedImageType && !actualContentType?.startsWith("image/")) {
+      actualContentType = detectedImageType;
+    }
+
+    const file = await cropImage(
+      (async function* webResponseToIterable() {
+        await Promise.resolve();
+        yield new Uint8Array(buffer);
+      })(),
+      resizeOptions
+    );
+
+    // Upload to Supabase
+    const { data, error } = await getSupabaseAdmin()
+      .storage.from(bucketName)
+      .upload(filename, file, {
+        contentType: actualContentType,
+        upsert: true,
+        metadata: {
+          source: "url",
+          originalUrl: imageUrl,
+        },
+      });
+
+    if (error) {
+      /** Log the error so we are aware if there are some issues with uploading */
+      logUploadError(error, {
+        imageUrl,
+        filename,
+        contentType,
+        bucketName,
+      });
+      throw error;
+    }
+
+    // After successful upload, cache the optimized version if cache is provided
+    if (cache && data.path) {
+      await cacheOptimizedImage(data.path, imageUrl, cache);
+    }
+
+    return data.path;
+  } catch (cause) {
+    const isShelfError = isLikeShelfError(cause);
+
+    // Log the error and return null instead of throwing
+    // This allows the import process to continue without the image
+    Logger.error(
+      new ShelfError({
+        cause,
+        message: isShelfError
+          ? cause.message
+          : "Failed to process and upload image from URL",
+        additionalData: { imageUrl, filename, contentType, bucketName },
+        label,
+        shouldBeCaptured: isShelfError ? cause.shouldBeCaptured : true,
+      })
+    );
+
+    return null; // Return null to indicate failure, allowing import to continue
+  }
+}
+
+export async function deleteProfilePicture({
+  url,
+  bucketName = "profile-pictures",
+}: {
+  url: string;
+  bucketName?: string;
+}) {
+  try {
+    if (
+      !url.startsWith(
+        `${SUPABASE_URL}/storage/v1/object/public/profile-pictures/`
+      ) ||
+      url === ""
+    ) {
+      throw new ShelfError({
+        cause: null,
+        message: "Invalid file URL",
+        additionalData: { url },
+        label,
+      });
+    }
+
+    const { error } = await getSupabaseAdmin()
+      .storage.from(bucketName)
+      .remove([url.split(`${bucketName}/`)[1]]);
+
+    if (error) {
+      throw error;
+    }
+  } catch (cause) {
+    Logger.error(
+      new ShelfError({
+        cause,
+        message: "Fail to delete the profile picture",
+        additionalData: { url, bucketName },
+        label,
+      })
+    );
+  }
+}
+
+export async function deleteAssetImage({
+  url,
+  bucketName,
+}: {
+  url: string;
+  bucketName: string;
+}) {
+  try {
+    const path = extractImageNameFromSupabaseUrl({ url, bucketName });
+    if (!path) {
+      throw new ShelfError({
+        cause: null,
+        message: "Cannot extract the image path from the URL",
+        additionalData: { url, bucketName },
+        label,
+      });
+    }
+
+    const { error } = await getSupabaseAdmin()
+      .storage.from(bucketName)
+      .remove([path]);
+
+    if (error) {
+      throw error;
+    }
+
+    return true;
+  } catch (cause) {
+    Logger.error(
+      new ShelfError({
+        cause,
+        message: "Fail to delete the asset image",
+        additionalData: { url, bucketName },
+        label,
+      })
+    );
+  }
+}
+
+/**
+ * This function constructs the path for the file to be uploaded to Supabase storage.
+ */
+export function getFileUploadPath({
+  organizationId,
+  type,
+  typeId,
+}: {
+  organizationId: string;
+  type: "locations" | "audits" | "asset-models";
+  typeId: string;
+}) {
+  return `${organizationId}/${type}/${typeId}/${id()}`;
+}
+
+/**
+ * This function remove the public file from `files` bucket in Supabase using a public URL.
+ */
+export async function removePublicFile({ publicUrl }: { publicUrl: string }) {
+  try {
+    if (
+      !publicUrl.startsWith(
+        `${SUPABASE_URL}/storage/v1/object/public/${PUBLIC_BUCKET}/`
+      )
+    ) {
+      throw new ShelfError({
+        cause: null,
+        message: "Invalid file URL",
+        additionalData: { publicUrl },
+        label,
+      });
+    }
+
+    const { error } = await getSupabaseAdmin()
+      .storage.from(PUBLIC_BUCKET)
+      .remove([publicUrl.split(`${PUBLIC_BUCKET}/`)[1]]);
+
+    if (error) {
+      throw error;
+    }
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: isLikeShelfError(cause)
+        ? cause.message
+        : "Failed to remove file. Please try again.",
+      label,
+    });
+  }
+}
+
+/**
+ * Most objects Supabase Storage deletes in one `remove()` request. The API
+ * rejects a larger list, so callers with more files must split them.
+ */
+export const MAX_PUBLIC_FILES_PER_REMOVE = 1000;
+
+/**
+ * Removes many files from the public `files` bucket in a single storage
+ * request, using their public URLs.
+ *
+ * A URL that does not point into the public bucket is skipped rather than
+ * failing the rest, and counted in the result so the caller can log it.
+ * Objects that no longer exist are not an error.
+ *
+ * @param publicUrls - Public URLs of the files, at most
+ *   {@link MAX_PUBLIC_FILES_PER_REMOVE}
+ * @returns How many URLs were skipped because they are not public bucket URLs
+ * @throws {ShelfError} When the list is too long or the storage request fails
+ */
+export async function removePublicFiles({
+  publicUrls,
+}: {
+  publicUrls: string[];
+}): Promise<{ invalidUrlCount: number }> {
+  if (publicUrls.length > MAX_PUBLIC_FILES_PER_REMOVE) {
+    throw new ShelfError({
+      cause: null,
+      message: `Cannot remove more than ${MAX_PUBLIC_FILES_PER_REMOVE} files in one request`,
+      additionalData: { count: publicUrls.length },
+      label,
+    });
+  }
+
+  const bucketPrefix = `${SUPABASE_URL}/storage/v1/object/public/${PUBLIC_BUCKET}/`;
+  const paths = publicUrls
+    .filter((publicUrl) => publicUrl.startsWith(bucketPrefix))
+    .map((publicUrl) => publicUrl.slice(bucketPrefix.length));
+  const invalidUrlCount = publicUrls.length - paths.length;
+
+  if (paths.length === 0) {
+    return { invalidUrlCount };
+  }
+
+  try {
+    const { error } = await getSupabaseAdmin()
+      .storage.from(PUBLIC_BUCKET)
+      .remove(paths);
+
+    if (error) {
+      throw error;
+    }
+  } catch (cause) {
+    throw new ShelfError({
+      cause,
+      message: "Failed to remove files. Please try again.",
+      additionalData: { count: paths.length },
+      label,
+    });
+  }
+
+  return { invalidUrlCount };
+}
+
+/**
+ * Supabase can sporadically return HTML error pages (e.g., CDN/edge 50x) that the storage
+ * client surfaces as StorageUnknownError due to JSON parsing. Detect that shape so callers
+ * can retry instead of immediately failing user-visible flows.
+ */
+function isSupabaseHtmlError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const message =
+    "message" in error && typeof error.message === "string"
+      ? error.message
+      : "";
+  const name =
+    "name" in error && typeof error.name === "string" ? error.name : "";
+
+  // Detect JSON parse failures that typically show up when HTML is returned instead of JSON
+  const lowerMessage = message.toLowerCase();
+  const isJsonParseFailure =
+    lowerMessage.includes("unexpected token") && lowerMessage.includes("json");
+  const mentionsHtml =
+    lowerMessage.includes("<html") ||
+    lowerMessage.includes("html>") ||
+    lowerMessage.includes("text/html");
+  const isUnexpectedHtml =
+    isJsonParseFailure && (mentionsHtml || lowerMessage.includes("<"));
+  const isStorageUnknown =
+    name === "StorageUnknownError" ||
+    ("__isStorageError" in error &&
+      typeof error.__isStorageError === "boolean" &&
+      error.__isStorageError === true);
+
+  return isUnexpectedHtml && isStorageUnknown;
+}
+
+/**
+ * Supabase can also surface network failures as StorageUnknownError with a
+ * generic "fetch failed" message. Treat those as transient for retries.
+ */
+function isSupabaseFetchFailedError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const message =
+    "message" in error && typeof error.message === "string"
+      ? error.message
+      : "";
+  const name =
+    "name" in error && typeof error.name === "string" ? error.name : "";
+
+  const lowerMessage = message.toLowerCase();
+  const isFetchFailed = lowerMessage.includes("fetch failed");
+  const isStorageUnknown =
+    name === "StorageUnknownError" ||
+    ("__isStorageError" in error &&
+      typeof error.__isStorageError === "boolean" &&
+      error.__isStorageError === true);
+
+  return isFetchFailed && isStorageUnknown;
+}
+
+/**
+ * Supabase returns HTTP 429 when too many requests hit the storage API.
+ * The client surfaces this as a StorageApiError. Detect it so callers
+ * can back off and retry instead of immediately failing.
+ */
+export function isSupabaseRateLimitError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const name =
+    "name" in error && typeof error.name === "string" ? error.name : "";
+  const message =
+    "message" in error && typeof error.message === "string"
+      ? error.message
+      : "";
+  const status =
+    "status" in error && typeof error.status === "number" ? error.status : 0;
+  const statusCode =
+    "statusCode" in error && typeof error.statusCode === "string"
+      ? error.statusCode
+      : "";
+
+  const isRateLimitStatus = status === 429 || statusCode === "429";
+  const isRateLimitMessage = message.toLowerCase().includes("too many");
+  const isStorageApiError = name === "StorageApiError";
+
+  return isStorageApiError && (isRateLimitStatus || isRateLimitMessage);
+}
+
+/**
+ * Supabase returns HTTP 5xx (502, 503, 504, etc.) on transient infrastructure
+ * issues like gateway timeouts. The client surfaces these as StorageApiError.
+ * Detect them so callers can retry instead of immediately failing.
+ */
+export function isSupabaseServerError(error: unknown) {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+
+  const name =
+    "name" in error && typeof error.name === "string" ? error.name : "";
+  const status =
+    "status" in error && typeof error.status === "number" ? error.status : 0;
+  const statusCode =
+    "statusCode" in error && typeof error.statusCode === "string"
+      ? error.statusCode
+      : "";
+
+  const isServerStatus =
+    (status >= 500 && status <= 599) ||
+    (statusCode !== "" &&
+      Number(statusCode) >= 500 &&
+      Number(statusCode) <= 599);
+  const isStorageApiError = name === "StorageApiError";
+
+  return isStorageApiError && isServerStatus;
+}

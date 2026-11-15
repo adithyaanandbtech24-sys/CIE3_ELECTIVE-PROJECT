@@ -1,0 +1,271 @@
+import { memo, useMemo } from "react";
+import {
+  View,
+  Text,
+  TextInput,
+  TouchableOpacity,
+  ActivityIndicator,
+} from "react-native";
+import { Ionicons } from "@expo/vector-icons";
+import { formatDate, type ResolvedFormatPrefs } from "@shelf/datetime";
+import type { AssetNote } from "@/lib/api";
+import { useTheme } from "@/lib/theme-context";
+import { createStyles } from "@/lib/create-styles";
+import { fontSize, spacing, borderRadius, formatStatus } from "@/lib/constants";
+import { useFormatPrefs } from "@/lib/use-date-formatter";
+import { markdocToSegments } from "@/lib/note-plain-text";
+import { getActiveServer } from "@/lib/server/active-server";
+import { LinkedParagraph } from "@/components/links/linked-paragraph";
+
+interface NotesSectionProps {
+  notes: AssetNote[] | undefined;
+  noteText: string;
+  onChangeNoteText: (text: string) => void;
+  onPostNote: () => void;
+  isPostingNote: boolean;
+  /**
+   * When `false` the post-note input and button are disabled with a hint
+   * label. The parent uses this to surface the case where the workspace
+   * context (`currentOrg`) hasn't resolved yet — without it the user can
+   * type a note, tap Post, and silently get nothing because the parent
+   * `handlePostNote` early-returns on missing `orgId`.
+   */
+  canPostNote?: boolean;
+}
+
+export const NotesSection = memo(function NotesSection({
+  notes,
+  noteText,
+  onChangeNoteText,
+  onPostNote,
+  isPostingNote,
+  canPostNote = true,
+}: NotesSectionProps) {
+  const { colors } = useTheme();
+  const styles = useStyles();
+
+  const postDisabled = !noteText.trim() || isPostingNote || !canPostNote;
+
+  return (
+    <View style={styles.sectionContainer}>
+      <Text style={styles.sectionTitle}>
+        Activity{notes?.length ? ` (${notes.length})` : ""}
+      </Text>
+
+      {/* Add note input: hidden for members without note:create (the server
+          requires it); read-only activity feed still renders below. */}
+      {canPostNote && (
+        <View style={styles.noteInputContainer}>
+          <TextInput
+            style={styles.noteInput}
+            value={noteText}
+            onChangeText={onChangeNoteText}
+            placeholder="Add a note..."
+            placeholderTextColor={colors.placeholderText}
+            multiline
+            maxLength={5000}
+            accessibilityLabel="Add a note"
+          />
+          <TouchableOpacity
+            style={[
+              styles.notePostBtn,
+              postDisabled && styles.notePostBtnDisabled,
+            ]}
+            onPress={onPostNote}
+            disabled={postDisabled}
+            accessibilityLabel="Post note"
+            accessibilityRole="button"
+            accessibilityState={{ disabled: postDisabled }}
+          >
+            {isPostingNote ? (
+              <ActivityIndicator
+                size="small"
+                color={colors.primaryForeground}
+              />
+            ) : (
+              <Ionicons
+                name="send"
+                size={16}
+                color={colors.primaryForeground}
+              />
+            )}
+          </TouchableOpacity>
+        </View>
+      )}
+
+      {/* Notes list */}
+      {notes && notes.length > 0 ? (
+        <View style={styles.notesList}>
+          {notes.map((note) => (
+            <NoteItem key={note.id} note={note} />
+          ))}
+        </View>
+      ) : (
+        <Text style={styles.emptyNotes}>No activity yet</Text>
+      )}
+    </View>
+  );
+});
+
+// ── Helpers ─────────────────────────────────────────────
+
+function timeAgo(dateStr: string, prefs: ResolvedFormatPrefs): string {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "Just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days}d ago`;
+  // Older than a week: fall back to the user's absolute date format + timezone.
+  return formatDate(dateStr, prefs);
+}
+
+// ── Sub-components ──────────────────────────────────────
+
+const NoteItem = memo(function NoteItem({ note }: { note: AssetNote }) {
+  const { colors } = useTheme();
+  const styles = useStyles();
+  const prefs = useFormatPrefs();
+  const userName = note.user
+    ? [note.user.firstName, note.user.lastName].filter(Boolean).join(" ") ||
+      "User"
+    : "System";
+  const isUpdate = note.type === "UPDATE";
+  // The connected server, read each render: a note link resolves against it.
+  const baseUrl = getActiveServer().baseUrl;
+  const segments = useMemo(
+    () =>
+      markdocToSegments(
+        note.content,
+        {
+          date: (iso) => formatDate(iso, prefs),
+          // why: the shared helper rather than a local sentence-caser, so a
+          // wording change in @shelf/labels reaches this preview too.
+          status: formatStatus,
+        },
+        baseUrl,
+        // A comment's Markdown links read as their labels; a system note's
+        // typed values never hide an outside link (as on the web).
+        { allowExternalLinks: !isUpdate }
+      ),
+    [note.content, prefs, isUpdate, baseUrl]
+  );
+
+  return (
+    <View style={[styles.noteItem, isUpdate && styles.noteItemUpdate]}>
+      <View style={styles.noteHeader}>
+        <View style={styles.noteUserRow}>
+          <View
+            style={[styles.noteAvatar, isUpdate && styles.noteAvatarUpdate]}
+          >
+            <Ionicons
+              name={isUpdate ? "refresh-outline" : "chatbubble-outline"}
+              size={12}
+              color={isUpdate ? colors.muted : colors.primaryForeground}
+            />
+          </View>
+          <Text style={styles.noteUserName}>{userName}</Text>
+        </View>
+        <Text style={styles.noteTime}>{timeAgo(note.createdAt, prefs)}</Text>
+      </View>
+      <LinkedParagraph
+        text={note.content}
+        segments={segments}
+        style={styles.noteContent}
+        selectable
+      />
+    </View>
+  );
+});
+
+const useStyles = createStyles((colors, shadows) => ({
+  sectionContainer: { paddingHorizontal: spacing.lg, marginTop: spacing.xl },
+  sectionTitle: {
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.muted,
+    textTransform: "uppercase",
+    letterSpacing: 0.5,
+    marginBottom: spacing.sm,
+  },
+  noteInputContainer: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    gap: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  noteInput: {
+    flex: 1,
+    backgroundColor: colors.white,
+    borderRadius: borderRadius.lg,
+    borderWidth: 1,
+    borderColor: colors.gray300,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 10,
+    fontSize: fontSize.base,
+    color: colors.foreground,
+    maxHeight: 80,
+    minHeight: 40,
+    ...shadows.sm,
+  },
+  notePostBtn: {
+    backgroundColor: colors.primary,
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  notePostBtnDisabled: { opacity: 0.4 },
+  notesList: { gap: spacing.sm },
+  emptyNotes: {
+    fontSize: fontSize.base,
+    color: colors.mutedLight,
+    textAlign: "center",
+    paddingVertical: spacing.xl,
+  },
+  noteItem: {
+    backgroundColor: colors.white,
+    borderRadius: borderRadius.lg,
+    padding: spacing.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  noteItemUpdate: {
+    borderColor: colors.borderLight,
+    backgroundColor: colors.backgroundTertiary,
+  },
+  noteHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: spacing.xs,
+  },
+  noteUserRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+  noteAvatar: {
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    backgroundColor: colors.iconDefault,
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  noteAvatarUpdate: {
+    backgroundColor: colors.backgroundTertiary,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  noteUserName: {
+    fontSize: fontSize.sm,
+    fontWeight: "600",
+    color: colors.foreground,
+  },
+  noteTime: { fontSize: fontSize.xs, color: colors.mutedLight },
+  noteContent: {
+    fontSize: fontSize.base,
+    color: colors.foregroundSecondary,
+    lineHeight: 20,
+  },
+}));

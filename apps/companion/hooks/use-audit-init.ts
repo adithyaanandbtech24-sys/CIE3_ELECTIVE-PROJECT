@@ -1,0 +1,470 @@
+import { useState, useEffect, useRef } from "react";
+import { Alert, Animated } from "react-native";
+import { api, type AuditExpectedAsset } from "@/lib/api";
+import { countFieldsFromScan, entriesToResync } from "@/lib/audit-scan-queue";
+import {
+  loadAuditScanState,
+  clearAuditScanState,
+  createDebouncedSaver,
+  pruneStaleAuditDrafts,
+  adoptUnownedDraft,
+  guardRecoveryActions,
+} from "@/lib/audit-scan-persistence";
+import { auditDeletedAssetLabel } from "@shelf/labels";
+import { announce } from "@/lib/a11y";
+import { reportAuditDurabilityEvent } from "@/lib/sentry";
+
+// ── Types ────────────────────────────────────────────────
+
+export type ScannedItem = {
+  assetId: string;
+  name: string;
+  isExpected: boolean;
+  scannedAt: string;
+  /**
+   * The AuditScan row id, set on every scan restored from the server.
+   *
+   * A deleted asset's row REQUIRES it as its list key — `assetId` is empty for
+   * those, so nothing else identifies the row. Absent on scans made live in
+   * this session, which have not reached the server yet, and on servers too
+   * old to send it.
+   */
+  scanId?: string;
+  /**
+   * The scanned asset has since been deleted, so nothing behind this row can
+   * be opened or re-fetched. The name already says so; this is what the list
+   * reads to keep the row from being treated as an ordinary scan.
+   */
+  assetDeleted?: boolean;
+  /** The audit-asset record ID, needed for adding notes/photos. Set after server confirms scan. */
+  auditAssetId?: string;
+  /** Local count of notes added during this session (optimistic). */
+  notesCount?: number;
+  /** Local count of photos added during this session (optimistic). */
+  imagesCount?: number;
+  /**
+   * True when this scan exhausted its sync retries and has not yet reached the
+   * server. Surfaced in the UI and blocks audit completion until re-synced.
+   */
+  syncFailed?: boolean;
+  /**
+   * Where the asset is supposed to be. Shown on the scanned row so the tab
+   * carries the same orienting detail the Not-scanned tab already does —
+   * standing in a room, "which shelf" is more useful than re-reading that a
+   * scan was scanned. Null when the asset has no location, or (for an
+   * unexpected asset scanned live) until the server round-trip fills it in.
+   */
+  locationName?: string | null;
+  /**
+   * Thumbnail for the same reason: the Not-scanned tab shows one, so an eye
+   * moving between tabs should not have to switch modes. Null when absent.
+   */
+  thumbnailImage?: string | null;
+  /**
+   * Units expected and counted, for a quantity-tracked asset. Both absent for
+   * an individual asset. `foundQuantity` is null on a scan made by a build
+   * that did not ask for a count.
+   */
+  expectedQuantity?: number | null;
+  foundQuantity?: number | null;
+  unitOfMeasure?: string | null;
+};
+
+export type ScanQueueEntry = {
+  auditSessionId: string;
+  qrId: string;
+  assetId: string;
+  isExpected: boolean;
+  /** Units counted, for a quantity-tracked asset. */
+  foundQuantity?: number;
+  /** When the entry was queued (ms); orders counts for the same asset. */
+  queuedAt?: number;
+  /**
+   * True for a recount of a scan already recorded. Crash recovery replays only
+   * these for assets the server has; a first scan the server already holds is
+   * not sent again.
+   */
+  recount?: boolean;
+  retryCount?: number;
+};
+
+type UseAuditInitParams = {
+  auditId: string | undefined;
+  orgId: string | undefined;
+  /**
+   * The signed-in account. Only its own draft is offered for recovery, and
+   * the audit waits for it before loading.
+   */
+  userId: string | undefined;
+  progressAnim: Animated.Value;
+  animateProgress: (newFound: number) => void;
+  processQueue: () => void;
+  scanQueueRef: React.MutableRefObject<ScanQueueEntry[]>;
+};
+
+export type AuditInitResult = {
+  auditName: string;
+  isInitializing: boolean;
+  initError: string | null;
+  expectedAssetIdsRef: React.MutableRefObject<Set<string>>;
+  expectedAssetMapRef: React.MutableRefObject<Map<string, AuditExpectedAsset>>;
+  scannedAssetIdsRef: React.MutableRefObject<Set<string>>;
+  foundCount: number;
+  setFoundCount: React.Dispatch<React.SetStateAction<number>>;
+  unexpectedCount: number;
+  setUnexpectedCount: React.Dispatch<React.SetStateAction<number>>;
+  expectedTotal: number;
+  scannedItems: ScannedItem[];
+  setScannedItems: React.Dispatch<React.SetStateAction<ScannedItem[]>>;
+  scannedItemsRef: React.MutableRefObject<ScannedItem[]>;
+  debouncedSaverRef: React.MutableRefObject<ReturnType<
+    typeof createDebouncedSaver
+  > | null>;
+  /**
+   * True while the "Resume Previous Session?" prompt is unanswered. The
+   * stored draft must then survive the screen closing.
+   */
+  recoveryPendingRef: React.MutableRefObject<boolean>;
+};
+
+export function useAuditInit({
+  auditId,
+  orgId,
+  userId,
+  progressAnim,
+  animateProgress,
+  processQueue,
+  scanQueueRef,
+}: UseAuditInitParams): AuditInitResult {
+  const [auditName, setAuditName] = useState("");
+  const [isInitializing, setIsInitializing] = useState(true);
+  const [initError, setInitError] = useState<string | null>(null);
+
+  // O(1) lookup sets
+  const expectedAssetIdsRef = useRef(new Set<string>());
+  const expectedAssetMapRef = useRef(new Map<string, AuditExpectedAsset>());
+  const scannedAssetIdsRef = useRef(new Set<string>());
+
+  // Counters (optimistic)
+  const [foundCount, setFoundCount] = useState(0);
+  const [unexpectedCount, setUnexpectedCount] = useState(0);
+  const [expectedTotal, setExpectedTotal] = useState(0);
+
+  // Scanned items list (most recent first)
+  const [scannedItems, setScannedItems] = useState<ScannedItem[]>([]);
+
+  // Persistence (crash recovery)
+  const scannedItemsRef = useRef<ScannedItem[]>([]);
+  const debouncedSaverRef = useRef<ReturnType<
+    typeof createDebouncedSaver
+  > | null>(null);
+  const recoveryPendingRef = useRef(false);
+
+  useEffect(() => {
+    if (!auditId || !orgId || !userId) return;
+
+    // A load that finishes after the audit, workspace or account changed
+    // belongs to the old ones: it must not install its saver or state.
+    let cancelled = false;
+    recoveryPendingRef.current = false;
+
+    (async () => {
+      setIsInitializing(true);
+      setInitError(null);
+
+      const { data, error } = await api.audit(auditId, orgId);
+      if (cancelled) return;
+      if (error || !data) {
+        setInitError(error || "Failed to load audit");
+        setIsInitializing(false);
+        return;
+      }
+
+      setAuditName(data.audit.name);
+      setExpectedTotal(data.audit.expectedAssetCount);
+      setFoundCount(data.audit.foundAssetCount);
+      setUnexpectedCount(data.audit.unexpectedAssetCount);
+
+      // Build O(1) lookup sets
+      const expectedIds = new Set<string>();
+      const expectedMap = new Map<string, AuditExpectedAsset>();
+      for (const asset of data.expectedAssets) {
+        expectedIds.add(asset.id);
+        expectedMap.set(asset.id, asset);
+      }
+      expectedAssetIdsRef.current = expectedIds;
+      expectedAssetMapRef.current = expectedMap;
+
+      // Restore existing scans from server (including evidence counts)
+      const scannedIds = new Set<string>();
+      const restoredItems: ScannedItem[] = [];
+      for (const scan of data.existingScans) {
+        scannedIds.add(scan.assetId);
+        // why: an expected asset already has its full record client-side, so
+        // prefer it for the image; the scan payload only carries a location.
+        const expected = expectedMap.get(scan.assetId);
+        // A scan whose asset was deleted keeps only the title captured at scan
+        // time. Naming it plainly would render it as an ordinary live asset,
+        // which is worse than the blank row it replaced — the auditor would go
+        // looking for something that no longer exists. Older servers omit the
+        // flag, so an empty `assetId` stands in for it.
+        const assetDeleted = scan.assetDeleted || !scan.assetId;
+        restoredItems.push({
+          assetId: scan.assetId,
+          scanId: scan.id,
+          assetDeleted,
+          name: assetDeleted
+            ? auditDeletedAssetLabel(scan.assetTitle)
+            : scan.assetTitle,
+          isExpected: scan.isExpected,
+          scannedAt: scan.scannedAt,
+          auditAssetId: scan.auditAssetId ?? undefined,
+          notesCount: scan.auditNotesCount,
+          imagesCount: scan.auditImagesCount,
+          locationName:
+            scan.assetLocationName ?? expected?.locationName ?? null,
+          thumbnailImage:
+            expected?.thumbnailImage ?? expected?.mainImage ?? null,
+          ...countFieldsFromScan(scan),
+        });
+      }
+      scannedAssetIdsRef.current = scannedIds;
+      setScannedItems(restoredItems);
+      scannedItemsRef.current = restoredItems;
+
+      // Set initial progress
+      const progress =
+        data.audit.expectedAssetCount > 0
+          ? data.audit.foundAssetCount / data.audit.expectedAssetCount
+          : 0;
+      progressAnim.setValue(Math.min(progress, 1));
+
+      // ── Crash recovery ───────────────────────────────
+      // A draft saved by an older build has no owner; one with unsent scans
+      // for this audit is adopted when this account may scan it, and then
+      // offered with a prompt that says it may be someone else's.
+      const adopted = await adoptUnownedDraft(userId, auditId, {
+        mayScan: data.canScan,
+      });
+      const persisted = await loadAuditScanState(userId, auditId);
+      if (cancelled) return;
+
+      // Installed only once this load is known to be current, so a cancelled
+      // load never leaves a saver bound to the old account or audit.
+      debouncedSaverRef.current = createDebouncedSaver(userId, auditId);
+      // Housekeeping runs after the load, so the resume prompt never waits.
+      void pruneStaleAuditDrafts();
+      // why: gate on whether there is ANYTHING to recover (the inner check
+      // below decides recover-vs-clear from scanned items OR a non-empty
+      // queue), not on scannedItems alone. The eager queue-persist can write a
+      // fresh queue while scannedItems is still stale/empty (the list updates
+      // on a deferred render), so requiring scannedItems.length here would skip
+      // recovery and drop a queued scan. The queue is the durable record.
+      if (persisted) {
+        // Find items that were scanned locally but not yet on the server
+        const serverScannedIds = new Set(
+          data.existingScans.map((s) => s.assetId)
+        );
+        const recoveredItems = persisted.scannedItems.filter(
+          (item) => !serverScannedIds.has(item.assetId)
+        );
+        // Re-sync BOTH still-pending scans and scans that previously exhausted
+        // their retries (failedQueue). Without the failedQueue, a scan dropped
+        // after max retries would be merged back into the list as "found" but
+        // never re-submitted — and then marked MISSING on completion.
+        const pendingQueue = persisted.pendingQueue || [];
+        const failedQueue = persisted.failedQueue || [];
+        // Exclude anything the server already has: a crash after recordAuditScan
+        // succeeded but before the queue-removal snapshot persisted could leave a
+        // stale entry on disk; re-submitting it would double-record the scan.
+        // See entriesToResync: a queued count is kept even when the server
+        // has the scan (it is a recount), and only the newest count per asset.
+        const queuedForSync = entriesToResync(
+          pendingQueue,
+          failedQueue,
+          serverScannedIds
+        );
+
+        if (recoveredItems.length > 0 || queuedForSync.length > 0) {
+          // Show recovery dialog (don't block init)
+          setIsInitializing(false);
+          // Usually scannedItems and the queue agree; if only the queue
+          // survived (eager-persist before the list state committed), fall back
+          // to its length so the copy isn't "0 unsynced scans".
+          const unsyncedCount = Math.max(
+            recoveredItems.length,
+            queuedForSync.length
+          );
+          // Surface to Sentry: a previous session ended (kill/crash/background)
+          // with scans that never reached the server. Recovery is about to run
+          // — this tells us how often the durability net is actually catching.
+          reportAuditDurabilityEvent("session_recovered", {
+            auditId,
+            unsyncedCount,
+            recoveredItems: recoveredItems.length,
+            queuedForSync: queuedForSync.length,
+          });
+          // The alert can outlive its load (the audit, workspace or account
+          // changed): both buttons then do nothing, so old scans never reach
+          // a new scanner and one account never discards another's draft.
+          const recovery = guardRecoveryActions(() => cancelled, {
+            discard: () => {
+              recoveryPendingRef.current = false;
+              void clearAuditScanState(userId, auditId);
+            },
+            resume: () => {
+              recoveryPendingRef.current = false;
+              // A queued scan may have no recovered display item: the
+              // eager persist can save a queue entry before the list state
+              // commits. Rebuild display rows for those (name from the
+              // expected-asset map, else a neutral label) so they show as
+              // scanned, count correctly, and don't leave the Complete
+              // button hidden because scannedItems stayed empty.
+              const recoveredIds = new Set(
+                recoveredItems.map((i) => i.assetId)
+              );
+              // A recount of a scan the server already has keeps its
+              // restored row; it needs no second one.
+              const queuedOnlyItems: ScannedItem[] = queuedForSync
+                .filter(
+                  (e) =>
+                    !recoveredIds.has(e.assetId) &&
+                    !serverScannedIds.has(e.assetId)
+                )
+                .map((e) => ({
+                  assetId: e.assetId,
+                  name:
+                    expectedAssetMapRef.current.get(e.assetId)?.name ??
+                    "Scanned asset",
+                  isExpected: e.isExpected,
+                  scannedAt: new Date().toISOString(),
+                  expectedQuantity:
+                    expectedAssetMapRef.current.get(e.assetId)
+                      ?.expectedQuantity ?? null,
+                  foundQuantity: e.foundQuantity ?? null,
+                  unitOfMeasure:
+                    expectedAssetMapRef.current.get(e.assetId)?.unitOfMeasure ??
+                    null,
+                  locationName:
+                    expectedAssetMapRef.current.get(e.assetId)?.locationName ??
+                    null,
+                  thumbnailImage:
+                    expectedAssetMapRef.current.get(e.assetId)
+                      ?.thumbnailImage ??
+                    expectedAssetMapRef.current.get(e.assetId)?.mainImage ??
+                    null,
+                }));
+              const allRecovered = [...recoveredItems, ...queuedOnlyItems];
+
+              // Merge recovered items into state
+              for (const item of allRecovered) {
+                scannedIds.add(item.assetId);
+              }
+              scannedAssetIdsRef.current = scannedIds;
+
+              // A recount still queued shows its count on the restored
+              // row; the server's older one is replaced once it syncs.
+              const queuedCounts = new Map(
+                queuedForSync
+                  .filter((e) => e.foundQuantity !== undefined)
+                  .map((e) => [e.assetId, e.foundQuantity])
+              );
+              const merged = [
+                ...allRecovered,
+                ...restoredItems.map((item) =>
+                  queuedCounts.has(item.assetId)
+                    ? {
+                        ...item,
+                        foundQuantity: queuedCounts.get(item.assetId),
+                      }
+                    : item
+                ),
+              ];
+              setScannedItems(merged);
+              scannedItemsRef.current = merged;
+
+              // Requeue pending + previously-failed items for submission
+              if (queuedForSync.length > 0) {
+                scanQueueRef.current = queuedForSync.map((e) => ({
+                  ...e,
+                  retryCount: 0,
+                }));
+                // processQueue will be called after this callback
+                setTimeout(() => processQueue(), 100);
+              }
+
+              // Recalculate counters
+              let extraFound = 0;
+              let extraUnexpected = 0;
+              for (const item of allRecovered) {
+                if (item.isExpected) extraFound++;
+                else extraUnexpected++;
+              }
+              if (extraFound > 0) {
+                setFoundCount((prev) => prev + extraFound);
+                animateProgress(data.audit.foundAssetCount + extraFound);
+              }
+              if (extraUnexpected > 0) {
+                setUnexpectedCount((prev) => prev + extraUnexpected);
+              }
+
+              announce(
+                `Resumed ${allRecovered.length} scan${
+                  allRecovered.length !== 1 ? "s" : ""
+                } from previous session`
+              );
+            },
+          });
+          recoveryPendingRef.current = true;
+          Alert.alert(
+            "Resume Previous Session?",
+            adopted
+              ? `Found ${unsyncedCount} unsynced scan${
+                  unsyncedCount !== 1 ? "s" : ""
+                } saved on this phone by an earlier version of the app, possibly by someone else. Resume sends them as your scans.`
+              : `Found ${unsyncedCount} unsynced scan${
+                  unsyncedCount !== 1 ? "s" : ""
+                } from a previous session.`,
+            [
+              {
+                text: "Discard",
+                style: "destructive",
+                onPress: recovery.onDiscard,
+              },
+              { text: "Resume", onPress: recovery.onResume },
+            ]
+          );
+          return; // Skip the setIsInitializing below
+        } else {
+          // Server already has everything — clear stale state
+          clearAuditScanState(userId, auditId);
+        }
+      }
+
+      setIsInitializing(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [auditId, orgId, userId, progressAnim]);
+
+  return {
+    auditName,
+    isInitializing,
+    initError,
+    expectedAssetIdsRef,
+    expectedAssetMapRef,
+    scannedAssetIdsRef,
+    foundCount,
+    setFoundCount,
+    unexpectedCount,
+    setUnexpectedCount,
+    expectedTotal,
+    scannedItems,
+    setScannedItems,
+    scannedItemsRef,
+    debouncedSaverRef,
+    recoveryPendingRef,
+  };
+}
